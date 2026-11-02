@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import shutil
@@ -822,26 +823,49 @@ def _prepare_result_area(root: Path, language: str) -> None:
             stale_report.unlink()
 
 
+
+def _native_report_paths(language: str, root: Path) -> list[Path]:
+    """Return report locations owned by the native adapter for this language."""
+    if language == "java":
+        return [
+            path for path in root.rglob("TEST-*.xml")
+            if "surefire-reports" in path.parts or "test-results" in path.parts
+        ]
+    if language == "csharp":
+        return list((root / ".polyguard-results").rglob("*.trx"))
+    if language == "php":
+        return [root / ".polyguard-results" / "phpunit.xml"]
+    return []
+
+
+def _report_fingerprint(path: Path) -> tuple[int, int, int, int, str]:
+    stat = path.stat()
+    digest = hashlib.sha256(path.read_bytes()).hexdigest()
+    return (stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns, digest)
+
+
+def _snapshot_native_reports(language: str, root: Path) -> dict[Path, tuple[int, int, int, int, str]]:
+    """Capture report identities before execution; avoids filesystem clock precision bugs."""
+    snapshot: dict[Path, tuple[int, int, int, int, str]] = {}
+    for path in _native_report_paths(language, root):
+        try:
+            if path.is_file() and not path.is_symlink():
+                snapshot[path.resolve()] = _report_fingerprint(path)
+        except OSError:
+            continue
+    return snapshot
+
 def _native_report_evidence(
     language: str,
     root: Path,
     unit: ProjectUnit,
     units: list[ProjectUnit],
-    started_at_ns: int,
+    baseline_reports: dict[Path, tuple[int, int, int, int, str]],
 ) -> tuple[int | None, int | None, int | None, int | None, str]:
     """Read fresh native runner reports; never infer a pass count from a file name."""
-    if language == "java":
-        candidates = list(root.rglob("TEST-*.xml"))
-        candidates = [
-            path for path in candidates
-            if ("surefire-reports" in path.parts or "test-results" in path.parts)
-        ]
-    elif language == "csharp":
-        candidates = list((root / ".polyguard-results").rglob("*.trx"))
-    elif language == "php":
-        candidates = [root / ".polyguard-results" / "phpunit.xml"]
-    else:
+    if language not in NATIVE_REPORT_LANGUAGES:
         return None, None, None, None, "No native report adapter is registered."
+    candidates = _native_report_paths(language, root)
 
     nested_roots = {
         other.root for other in units
@@ -849,13 +873,21 @@ def _native_report_evidence(
         and other.language == unit.language
         and _is_within(other.root, unit.root)
     }
-    candidates = [
-        path for path in candidates
-        if path.is_file()
-        and path.stat().st_mtime_ns >= started_at_ns
-        and _is_within(path.resolve(), unit.root.resolve())
-        and not any(_is_within(path.resolve(), nested) for nested in nested_roots)
-    ]
+    fresh_candidates: list[Path] = []
+    for path in candidates:
+        try:
+            if not path.is_file() or path.is_symlink():
+                continue
+            resolved = path.resolve()
+            if not _is_within(resolved, unit.root.resolve()):
+                continue
+            if any(_is_within(resolved, nested) for nested in nested_roots):
+                continue
+            if baseline_reports.get(resolved) != _report_fingerprint(path):
+                fresh_candidates.append(path)
+        except OSError:
+            continue
+    candidates = fresh_candidates
     if not candidates:
         return None, None, None, None, f"No fresh {language} test report was produced."
 
@@ -963,7 +995,7 @@ def run_checks(
             ))
             continue
 
-        report_started_at_ns = time.time_ns()
+        report_baseline = _snapshot_native_reports(language, unit.root)
         started = time.monotonic()
         last_code: int | None = 0
         output_parts: list[str] = []
@@ -1029,7 +1061,7 @@ def run_checks(
                     tests_passed, tests_failed, tests_skipped, tests_total,
                     execution_evidence,
                 ) = _native_report_evidence(
-                    language, unit.root, unit, units, report_started_at_ns
+                    language, unit.root, unit, units, report_baseline
                 )
                 if tests_passed is None or tests_total is None:
                     passed = False
