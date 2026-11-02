@@ -1,4 +1,4 @@
-"""Language discovery, configurable test plans, and fail-closed execution."""
+"""Language discovery, configurable checks, and evidence-based fail-closed execution."""
 
 from __future__ import annotations
 
@@ -22,15 +22,45 @@ IGNORED_DIRS = {
     ".git", ".hg", ".svn", ".venv", "venv", "env", "node_modules",
     "__pycache__", ".mypy_cache", ".pytest_cache", ".tox", "dist",
     "build", ".polyguard-build", "target", ".next", ".nuxt",
+    ".polyguard-fixtures",
 }
 SUPPORTED_LANGUAGES = {
     "python", "rust", "go", "javascript", "java", "csharp",
-    "php", "ruby", "swift", "cpp",
+    "php", "ruby", "swift", "c", "cpp",
 }
 LANGUAGE_ALIASES = {
     "py": "python", "js": "javascript", "ts": "javascript",
-    "c": "cpp", "c++": "cpp", "cc": "cpp", "cxx": "cpp",
+    "cc": "cpp", "cxx": "cpp", "c++": "cpp",
     "cs": "csharp",
+}
+
+# These patterns require a positive success count, not merely a successful
+# process exit. The runner's own exit code remains authoritative for failures.
+DEFAULT_SUCCESS_PATTERNS = {
+    "python": [r"(?m)^\s*(\d+)\s+passed\b"],
+    "rust": [r"(?m)^test result: ok\.\s*(\d+)\s+passed;"],
+    "javascript": [
+        r"(?im)^\s*#\s*pass\s+(\d+)\s*$",
+        r"(?im)^\s*ℹ\s+pass\s+(\d+)\s*$",
+        r"(?im)^Tests:\s*(\d+)\s+passed\b",
+        r"\b(\d+)\s+passing\b",
+    ],
+    "java": [
+        r"\bTests run:\s*(\d+),\s*Failures:\s*0,\s*Errors:\s*0,\s*Skipped:\s*0\b",
+        r"\b(\d+)\s+tests completed,\s*0 failed\b",
+    ],
+    "csharp": [
+        r"\bPassed!\s+-\s+Failed:\s*0,\s*Passed:\s*(\d+),",
+        r"\bPassed:\s*(\d+)\s+Failed:\s*0\b",
+    ],
+    "php": [r"\bOK\s+\((\d+)\s+tests?"],
+    "ruby": [
+        r"\b(\d+)\s+examples?,\s+0\s+failures?\s*$",
+        r"\b(\d+)\s+runs?,\s+\d+\s+assertions?,\s+0\s+failures?,\s+0\s+errors?,\s+0\s+skips?\b",
+    ],
+    "swift": [r"\bExecuted\s+(\d+)\s+tests?,\s+with\s+0\s+failures?\b"],
+    "c": [r"\b100%\s+tests passed,\s*0\s+tests? failed\s+out of\s+(\d+)\b"],
+    "cpp": [r"\b100%\s+tests passed,\s*0\s+tests? failed\s+out of\s+(\d+)\b"],
 }
 
 
@@ -43,12 +73,15 @@ class CheckResult:
     elapsed_seconds: float
     reason: str = ""
     output: str = ""
+    tests_passed: int | None = None
+    execution_evidence: str = ""
 
 
 @dataclass
 class LanguageConfig:
     commands: list[list[str]]
     test_patterns: list[str]
+    success_patterns: list[str] | None = None
 
 
 def normalize_language(language: str) -> str:
@@ -57,9 +90,14 @@ def normalize_language(language: str) -> str:
 
 
 def _project_files(root: Path) -> list[Path]:
+    root = root.resolve()
     found: list[Path] = []
     for path in root.rglob("*"):
-        if any(part in IGNORED_DIRS for part in path.parts):
+        try:
+            relative = path.relative_to(root)
+        except ValueError:
+            continue
+        if any(part in IGNORED_DIRS for part in relative.parts):
             continue
         if path.is_file():
             found.append(path)
@@ -82,7 +120,7 @@ def _safe_read(path: Path) -> str:
 
 
 def _has_test(files: Iterable[Path], language: str, root: Path | None = None) -> bool:
-    """Require recognizable test declarations, not only test-looking filenames."""
+    """Conservative source-level precheck; this is not execution evidence."""
     all_files = list(files)
     base = root.resolve() if root else None
     for path in all_files:
@@ -129,12 +167,20 @@ def _has_test(files: Iterable[Path], language: str, root: Path | None = None) ->
         elif language == "swift" and suffix == ".swift":
             if in_test_tree and re.search(r"(?:\bfunc\s+test\w*\s*\(|@Test\b)", content):
                 return True
-        elif language == "cpp" and suffix in {".c", ".cc", ".cpp", ".cxx", ".h", ".hpp"}:
-            if (in_test_tree or "test" in name) and re.search(
+        elif language == "c" and suffix == ".c":
+            if in_test_tree and re.search(r"\b(?:test_\w+|main)\s*\(", content) and "assert(" in content:
+                cmake = [p for p in all_files if p.name.lower() == "cmakelists.txt"]
+                cmake_text = "\n".join(_safe_read(p) for p in cmake)
+                if re.search(r"\badd_test\s*\(", cmake_text):
+                    return True
+        elif language == "cpp" and suffix in {".cc", ".cpp", ".cxx", ".hpp", ".hh", ".hxx"}:
+            has_framework_test = re.search(
                 r"\b(?:TEST|TEST_F|TEST_P|TEST_CASE)\s*\(", content
-            ):
-                cmake_files = [p for p in all_files if p.name.lower() == "cmakelists.txt"]
-                cmake_text = "\n".join(_safe_read(p) for p in cmake_files)
+            )
+            has_assert_harness = re.search(r"\bmain\s*\(", content) and "assert(" in content
+            if (in_test_tree or "test" in name) and (has_framework_test or has_assert_harness):
+                cmake = [p for p in all_files if p.name.lower() == "cmakelists.txt"]
+                cmake_text = "\n".join(_safe_read(p) for p in cmake)
                 enabled = re.search(
                     r"\b(?:enable_testing)\s*\(|\binclude\s*\(\s*CTest\b", cmake_text, re.I
                 )
@@ -160,7 +206,7 @@ def _default_plans(root: Path) -> dict[str, list[list[str]]]:
     if "Cargo.toml" in names or any(p.suffix == ".rs" for p in files):
         plans["rust"] = [["cargo", "test", "--all-targets"]]
     if "go.mod" in names:
-        plans["go"] = [["go", "test", "./..."]]
+        plans["go"] = [["go", "test", "-json", "./..."]]
 
     js_project = "package.json" in names and any(
         p.suffix.lower() in {".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx"} for p in files
@@ -180,7 +226,7 @@ def _default_plans(root: Path) -> dict[str, list[list[str]]]:
         plans["java"] = [command]
 
     if any(p.suffix.lower() in {".csproj", ".sln"} for p in files):
-        plans["csharp"] = [["dotnet", "test"]]
+        plans["csharp"] = [["dotnet", "test", "--logger", "console;verbosity=normal"]]
 
     if "composer.json" in names:
         phpunit = root / "vendor" / "bin" / "phpunit"
@@ -190,23 +236,34 @@ def _default_plans(root: Path) -> dict[str, list[list[str]]]:
         if any(p.name.lower().endswith("_spec.rb") for p in files):
             plans["ruby"] = [["bundle", "exec", "rspec"]]
         else:
-            plans["ruby"] = [["bundle", "exec", "rake", "test"]]
+            # Minitest ships with standard Ruby distributions; this avoids
+            # assuming every project has a Rake task or a Rakefile.
+            plans["ruby"] = [[
+                "ruby", "-Itest", "-e",
+                "require 'minitest/autorun'; Dir.glob('test/**/*_test.rb').each { |file| require File.expand_path(file) }",
+            ]]
 
     if "Package.swift" in names:
         plans["swift"] = [["swift", "test"]]
 
-    if "CMakeLists.txt" in names:
-        cmake = next((p for p in files if p.name.lower() == "cmakelists.txt" and p.parent == root), None)
-        cmake_text = _safe_read(cmake) if cmake else ""
-        if re.search(r"enable_testing\s*\(|include\s*\(\s*CTest", cmake_text, re.I):
-            plans["cpp"] = [
-                ["cmake", "-S", ".", "-B", ".polyguard-build", "-DBUILD_TESTING=ON"],
-                ["cmake", "--build", ".polyguard-build", "--parallel"],
-                ["ctest", "--test-dir", ".polyguard-build", "--output-on-failure"],
-            ]
-        else:
-            plans["cpp"] = [["cmake", "-S", ".", "-B", ".polyguard-build"]]
+    cmake_files = [p for p in files if p.name.lower() == "cmakelists.txt"]
+    if cmake_files:
+        cmake_text = "\n".join(_safe_read(p) for p in cmake_files)
+        cmake_commands = [
+            ["cmake", "-S", ".", "-B", ".polyguard-build", "-DBUILD_TESTING=ON"],
+            ["cmake", "--build", ".polyguard-build", "--parallel"],
+            ["ctest", "--test-dir", ".polyguard-build", "--output-on-failure"],
+        ]
+        if any(p.suffix.lower() == ".c" for p in files):
+            plans["c"] = cmake_commands
+        if any(p.suffix.lower() in {".cc", ".cpp", ".cxx", ".hpp", ".hh", ".hxx"} for p in files):
+            plans["cpp"] = cmake_commands
     return plans
+
+
+def discover(root: Path) -> list[tuple[str, list[list[str]]]]:
+    """Return detected languages and their default commands."""
+    return list(_default_plans(root).items())
 
 
 def _load_config(root: Path, config_path: str | Path | None) -> tuple[set[str], dict[str, LanguageConfig]]:
@@ -248,10 +305,14 @@ def _load_config(root: Path, config_path: str | Path | None) -> tuple[set[str], 
         language = normalize_language(raw_language)
         if language not in SUPPORTED_LANGUAGES:
             raise ValueError(f"Unsupported language in [checks]: {raw_language}")
-        if not isinstance(section, dict) or set(section) - {"commands", "test_patterns"}:
-            raise ValueError(f"[checks.{raw_language}] supports only 'commands' and 'test_patterns'.")
+        allowed = {"commands", "test_patterns", "success_patterns"}
+        if not isinstance(section, dict) or set(section) - allowed:
+            raise ValueError(
+                f"[checks.{raw_language}] supports only 'commands', 'test_patterns', and 'success_patterns'."
+            )
         commands = section.get("commands")
         patterns = section.get("test_patterns")
+        success_patterns = section.get("success_patterns")
         if not isinstance(commands, list) or not commands:
             raise ValueError(f"[checks.{raw_language}].commands must be a non-empty array of argument arrays.")
         normalized_commands: list[list[str]] = []
@@ -267,7 +328,21 @@ def _load_config(root: Path, config_path: str | Path | None) -> tuple[set[str], 
             raise ValueError(f"[checks.{raw_language}].test_patterns must be a non-empty string array.")
         if any(".." in Path(pattern).parts for pattern in patterns):
             raise ValueError("Test patterns may not traverse outside the project root.")
-        configured[language] = LanguageConfig(normalized_commands, patterns)
+        if success_patterns is not None:
+            if not isinstance(success_patterns, list) or not success_patterns or not all(
+                isinstance(pattern, str) and pattern for pattern in success_patterns
+            ):
+                raise ValueError(
+                    f"[checks.{raw_language}].success_patterns must be a non-empty array of regex strings."
+                )
+            for pattern in success_patterns:
+                try:
+                    re.compile(pattern)
+                except re.error as exc:
+                    raise ValueError(
+                        f"Invalid success regex in [checks.{raw_language}]: {exc}"
+                    ) from exc
+        configured[language] = LanguageConfig(normalized_commands, patterns, success_patterns)
         required.add(language)
 
     return required, configured
@@ -283,9 +358,40 @@ def _matching_config_tests(root: Path, patterns: list[str]) -> bool:
     return False
 
 
-def discover(root: Path) -> list[tuple[str, list[list[str]]]]:
-    """Return detected languages and their default commands."""
-    return list(_default_plans(root).items())
+def _execution_evidence(
+    language: str,
+    output: str,
+    success_patterns: list[str] | None = None,
+) -> tuple[int | None, str]:
+    """Parse a positive successful-test count from a known runner summary."""
+    if language == "go" and success_patterns is None:
+        passed = 0
+        for line in output.splitlines():
+            try:
+                event = json.loads(line)
+            except (json.JSONDecodeError, TypeError):
+                continue
+            if event.get("Action") == "pass" and event.get("Test"):
+                passed += 1
+        if passed:
+            return passed, f"go test JSON: {passed} passing test event(s)"
+        return None, "go test JSON contained no passing test events."
+
+    patterns = success_patterns or DEFAULT_SUCCESS_PATTERNS.get(language, [])
+    total = 0
+    matched: list[str] = []
+    for pattern in patterns:
+        for match in re.finditer(pattern, output):
+            try:
+                count = int(match.group(1)) if match.lastindex else 1
+            except (TypeError, ValueError):
+                count = 0
+            if count > 0:
+                total += count
+                matched.append(pattern)
+    if total <= 0:
+        return None, "No positive successful-test count was found in runner output."
+    return total, f"Matched {len(set(matched))} execution-evidence pattern(s); {total} test(s) reported passing."
 
 
 def _failure_report(reason: str, language: str = "configuration") -> dict:
@@ -389,10 +495,27 @@ def run_checks(
                 break
 
         elapsed = time.monotonic() - started
+        combined_output = "\n".join(output_parts)[-12000:]
         passed = last_code == 0 and not failure_reason
+        tests_passed: int | None = None
+        execution_evidence = ""
+        if passed:
+            tests_passed, execution_evidence = _execution_evidence(
+                language,
+                combined_output,
+                language_config.success_patterns if language_config else None,
+            )
+            if tests_passed is None:
+                passed = False
+                failure_reason = (
+                    "Commands exited successfully, but Polyguard could not verify that any tests "
+                    "passed. Use a supported runner output format or configure success_patterns. "
+                    "Custom success_patterns are trusted project configuration, not independent proof."
+                )
         results.append(CheckResult(
             language, "PASS" if passed else "FAIL", commands, last_code,
-            round(elapsed, 3), failure_reason, "\n".join(output_parts)[-12000:],
+            round(elapsed, 3), failure_reason, combined_output,
+            tests_passed, execution_evidence,
         ))
 
     status = "PASS" if results and all(item.status == "PASS" for item in results) else "FAIL"
@@ -407,6 +530,10 @@ def render_report(report: dict, details: bool = False, as_json: bool = False) ->
     lines = [report["status"]]
     for item in report["results"]:
         lines.append(f"{item['language']}: {item['status']}")
+        if item.get("tests_passed") is not None:
+            lines.append(f"  Tests passed: {item['tests_passed']}")
+        if item.get("execution_evidence"):
+            lines.append(f"  Evidence: {item['execution_evidence']}")
         if item["reason"]:
             lines.append(f"  {item['reason']}")
         if item["output"]:

@@ -10,5 +10,9 @@ commands = [
   ["python3", "-m", "compileall", "-q", "src"],
   ["python3", "-m", "pytest", "-q"],
 ]
-# At least one matching file must exist before the commands are run.
+# At least one matching file must exist before commands are run.
 test_patterns = ["tests/test_*.py", "tests/**/*.py"]
+
+# Optional custom-output parser. This pattern requires a positive pytest pass count.
+# Custom patterns are trusted project configuration, not independent proof.
+success_patterns = ['(?m)^([0-9]+) passed']

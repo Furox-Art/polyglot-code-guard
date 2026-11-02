@@ -1,57 +1,72 @@
 # Polyguard
 
-**A fail-closed verification gate for AI-generated code across multiple programming languages.**
+**Fail-closed verification for AI-generated code across multiple programming languages.**
 
-Polyguard discovers supported project types, checks that a real test suite is present, executes the project's test/build commands, and reports a one-word verdict by default. It reports **PASS** only when every detected or explicitly required language has test evidence and every configured command exits successfully.
+Polyguard discovers supported project types, checks for a test suite, runs the relevant build/test commands, and returns a one-word verdict by default. A passing command exit code is not enough: Polyguard also requires a positive test-success summary from a recognized runner output format.
 
 ## Install
 
-```bash
+\`\`\`bash
 python -m pip install --upgrade polyglot-code-guard
-```
+\`\`\`
 
 ## Run
 
 From the target repository:
 
-```bash
+\`\`\`bash
 polyguard verify
-```
+\`\`\`
 
-Normal output is exactly one verdict:
+Default output:
 
-```text
+\`\`\`text
 PASS
-```
+\`\`\`
 
 or:
 
-```text
+\`\`\`text
 FAIL
-```
+\`\`\`
 
-Useful diagnostic modes:
+Diagnostics and automation:
 
-```bash
+\`\`\`bash
 polyguard verify --details
 polyguard verify --json
 polyguard verify --path ./my-project --timeout 180
 polyguard verify --config ./ci/polyguard.toml
 polyguard --version
-```
+\`\`\`
 
-Exit code is **0** for PASS and **1** for FAIL. A missing project, malformed configuration, missing test suite, missing toolchain, command error, or timeout fails closed.
+Exit code is **0** for PASS and **1** for FAIL. Missing tests, missing toolchains, invalid configuration, a build/test failure, timeout, or missing positive test-execution evidence returns FAIL.
 
-## Configure project-specific test commands
+## Built-in language support
 
-Automatic detection is useful for conventional projects, but real repositories often use custom layouts and test runners. Put a `.polyguard.toml` file in the project root, or pass a file with `--config`.
+| Language | Default build/test plan | Positive execution evidence |
+| --- | --- | --- |
+| Python | \`compileall\`, then \`pytest -q\` | Pytest passed-test summary |
+| Rust | \`cargo test --all-targets\` | Cargo test-result summary |
+| Go | \`go test -json ./...\` | Passing test events in JSON stream |
+| JavaScript / TypeScript | \`npm test\`; TypeScript also runs \`tsc --noEmit\` when configured | Recognized runner pass summary |
+| Java | Maven test or Gradle test | Maven/Gradle test summary |
+| C# | \`dotnet test\` | .NET test-runner pass summary |
+| PHP | PHPUnit | PHPUnit success summary |
+| Ruby | RSpec, or Ruby's Minitest runner | RSpec/Minitest success summary |
+| Swift | \`swift test\` | Swift test-result summary |
+| C | CMake build and CTest | CTest positive test count |
+| C++ | CMake build and CTest | CTest positive test count |
 
-Example:
+C and C++ are separate language identifiers in configuration. JavaScript and TypeScript share the npm project plan; TypeScript type checking does not replace running tests.
 
-```toml
+## Configure custom test commands
+
+For non-standard project layouts or test runners, create \`.polyguard.toml\` in the project root or pass one with \`--config\`.
+
+\`\`\`toml
 [project]
-# Every listed language is required for an overall PASS.
-languages = ["python", "rust"]
+languages = ["python"]
 
 [checks.python]
 commands = [
@@ -59,73 +74,73 @@ commands = [
   ["python3", "-m", "pytest", "-q"],
 ]
 test_patterns = ["tests/test_*.py", "tests/**/*.py"]
+success_patterns = ['(?m)^([0-9]+) passed']
+\`\`\`
 
-[checks.rust]
-commands = [["cargo", "test", "--all-targets"]]
-test_patterns = ["tests/**/*.rs", "src/**/*.rs"]
-```
+Configuration fields:
+- \`commands\`: non-empty argument arrays. Commands are launched without a shell.
+- \`test_patterns\`: at least one matching file must exist inside the project root.
+- \`success_patterns\`: optional regular expressions that extract a positive passing-test count from combined command output. If omitted, Polyguard uses the built-in pattern for that language.
 
-Rules:
-- `commands` is a non-empty list of argument arrays. Commands are launched without a shell.
-- `test_patterns` must match at least one file inside the project root.
-- A language under `[project].languages` is mandatory even if automatic detection misses it.
-- A custom check overrides the built-in commands and test-file heuristic for that language.
-- Patterns containing parent-directory traversal (`..`) are rejected.
-- Do not use a command that merely prints success; it must execute the actual test suite.
+**Trust boundary:** a user-defined command or output regex is a project-owner assertion. A malicious or incorrect command can print a fake summary. Polyguard cannot independently prove what an arbitrary custom command did. For the strongest built-in verification, use the default language runner or a recognized test-runner adapter and its native report. Do not use \`echo\`, \`print\`, or a dummy process as a test command.
 
-A starter file is available as `.polyguard.example.toml`.
+The verifier rejects invalid regular expressions and test patterns that traverse outside the project root.
 
-## Initial built-in language support
+## Test evidence and verdict rules
 
-| Language | Default command |
-| --- | --- |
-| Python | `python -m compileall`, then `python -m pytest` |
-| Rust | `cargo test --all-targets` |
-| Go | `go test ./...` |
-| JavaScript / TypeScript | `npm test`; TypeScript also runs `tsc --noEmit` when configured |
-| Java | Maven `test` or Gradle `test` |
-| C# | `dotnet test` |
-| PHP | PHPUnit |
-| Ruby | RSpec or Rake test |
-| Swift | `swift test` |
-| C / C++ | CMake build and CTest |
+A language check returns PASS only when:
+1. The project and required test suite are detected.
+2. Every required command completes successfully.
+3. The runner output contains a positive passing-test count, or a configured custom success pattern matches one.
+4. No command failure or timeout occurs.
 
-Automatic test evidence is detected using language-specific test names, declarations, or annotations. For unconventional frameworks, use `.polyguard.toml` to define the actual test commands and test file patterns.
+A zero-test run, an output with no recognized success summary, or a non-zero exit code returns FAIL. In JSON and detailed output, Polyguard includes the parsed test count and the evidence summary when available.
+
+## Integration tests
+
+The repository includes disposable real-project fixtures for toolchains available in the local environment. Run:
+
+\`\`\`bash
+python -m pip install -e ".[test]"
+python -m pytest -q
+\`\`\`
+
+Integration fixtures are created in temporary directories and run through Polyguard's actual project discovery and command execution path. Missing local toolchains are skipped by local integration tests; CI jobs install their required toolchains explicitly.
 
 ## AI coding-agent skill
 
-The repository contains `SKILL.md`. Add it to the coding agent's instruction/skills directory and require the agent to run:
+The repository includes \`SKILL.md\`, also shipped in the installed package. Agents should run:
 
-```bash
+\`\`\`bash
 polyguard verify --path . --details
-```
+\`\`\`
 
-Agents must not claim successful verification unless the command exits 0 and returns PASS. If any language fails, the overall result is FAIL. Agents must not delete, skip, or weaken tests to obtain PASS.
+Agents must not report successful verification unless the command exits 0 and returns PASS. They must not delete, skip, or weaken tests to manufacture a passing result.
 
 ## Important limitations and security
 
-Polyguard is a test execution gate, **not a formal proof of correctness**. PASS means the configured commands completed successfully; it does not guarantee comprehensive test coverage, correct requirements, or absence of defects. Tests can be weak or misleading. Test quality remains a separate responsibility.
+Polyguard is a test-execution gate, **not a formal proof of program correctness**. PASS means that the configured commands succeeded and a positive test-pass summary was recognized. It does not guarantee adequate test coverage, correct requirements, absence of defects, or trustworthy user-defined commands/patterns.
 
-The verifier executes project build scripts, package managers, and test commands. Treat repositories and dependencies as untrusted. Run them in a disposable container or VM without credentials, privileged access, or sensitive host mounts. Polyguard does not itself provide operating-system isolation.
+The verifier executes project build scripts, package managers, and tests. Treat repositories and dependencies as untrusted. Run them in a disposable container or VM without secrets, privileged access, or sensitive host mounts. Polyguard does not itself provide operating-system isolation.
 
-Built-in language recognition is intentionally conservative. Use explicit configuration for monorepos, non-standard directory structures, custom test frameworks, or multiple packages in one repository.
+Automatic language discovery is conservative. Custom frameworks can use explicit commands and success patterns. Full monorepo orchestration is not implemented yet: the current release does not discover every nested package or assign a separate working directory to each package. Run Polyguard separately from each package root until package-level configuration is added.
 
 ## Development
 
-```bash
+\`\`\`bash
 python -m pip install -e ".[test]"
 python -m pytest -q
 python -m build
 python -m twine check dist/*
-```
+\`\`\`
 
 ## Publishing
 
-The GitHub Actions workflow builds the distributions and publishes using PyPI Trusted Publishing. Configure the PyPI publisher for:
-- Owner: `Furox-Art`
-- Repository: `polyglot-code-guard`
-- Workflow: `publish.yml`
-- Environment: `pypi`
+GitHub Actions builds the distributions and publishes with PyPI Trusted Publishing. Configure the PyPI publisher for:
+- Owner: \`Furox-Art\`
+- Repository: \`polyglot-code-guard\`
+- Workflow: \`publish.yml\`
+- Environment: \`pypi\`
 
 ## License
 
