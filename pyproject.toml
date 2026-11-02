@@ -1,0 +1,46 @@
+[build-system]
+requires = ["setuptools>=77", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "polyglot-code-guard"
+version = "0.1.0"
+description = "Fail-closed, multi-language test verification for AI-generated code."
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+authors = [{ name = "Furox-Art" }]
+keywords = ["testing", "code-verification", "polyglot", "ai-generated-code", "quality-gate"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Intended Audience :: Developers",
+  "Operating System :: OS Independent",
+  "Programming Language :: Python :: 3",
+  "Topic :: Software Development :: Testing",
+]
+dependencies = []
+
+[project.optional-dependencies]
+test = ["pytest>=8.0"]
+
+[project.scripts]
+polyguard = "polyguard.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/Furox-Art/polyglot-code-guard"
+Repository = "https://github.com/Furox-Art/polyglot-code-guard"
+Issues = "https://github.com/Furox-Art/polyglot-code-guard/issues"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+include-package-data = true
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+polyguard = ["SKILL.md"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
