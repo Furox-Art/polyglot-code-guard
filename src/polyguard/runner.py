@@ -759,7 +759,7 @@ def _execution_evidence(
             if "Elapsed" in event and (
                 isinstance(event["Elapsed"], bool)
                 or not isinstance(event["Elapsed"], (int, float))
-                or event["Elapsed"] < 0
+                or not 0 <= event["Elapsed"] < float("inf")
             ):
                 return None, "go test JSON event has an invalid Elapsed field."
             if action == "pass" and isinstance(event.get("Test"), str) and event.get("Test"):
