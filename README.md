@@ -49,16 +49,16 @@ Exit code is **0** for PASS and **1** for FAIL. Missing tests, missing toolchain
 | Python | \`compileall\`, then \`pytest -q\` | Pytest passed-test summary |
 | Rust | \`cargo test --all-targets\` | Cargo test-result summary |
 | Go | \`go test -json ./...\` | Passing test events in JSON stream |
-| JavaScript / TypeScript | Direct Vitest/Jest/Mocha/TAP CLI when declared, otherwise `node --test`; TypeScript also runs `tsc --noEmit` when configured | Recognized runner pass summary (including Vitest default/minimal, Jest, Mocha, and Node TAP formats) |
+| JavaScript / TypeScript | Direct Vitest/Jest/Mocha/TAP CLI when declared, otherwise `node --test --test-reporter=junit`; TypeScript also runs `tsc --noEmit` when configured | Node fallback: validated JUnit test-case records; declared runners: recognized runner summary |
 | Java | Maven `clean test` or Gradle `clean test` | Parsed Surefire/Gradle JUnit XML; at least one pass, zero failures |
 | C# | dotnet test with a Polyguard TRX prefix | Parsed TRX counters; at least one pass, zero failures |
 | PHP | PHPUnit with --log-junit | Parsed JUnit XML; at least one pass, zero failures |
 | Ruby | RSpec, or Ruby's Minitest runner | RSpec/Minitest success summary |
 | Swift | `swift test --parallel` | Recognized Swift Testing/XCTest runner summary with a positive passed-test count |
-| C | CMake build and CTest | CTest positive test count |
-| C++ | CMake build and CTest | CTest positive test count |
+| C | CMake build and CTest | Counts per-test `Passed` records; aggregate pass percentages do not prove execution |
+| C++ | CMake build and CTest | Counts per-test `Passed` records; aggregate pass percentages do not prove execution |
 
-C and C++ are separate language identifiers in configuration. JavaScript and TypeScript share the same project plan; TypeScript type checking does not replace running tests. Project-defined npm `test` scripts are never treated as test-execution evidence.
+C and C++ are separate language identifiers in configuration. JavaScript and TypeScript share the same project plan; TypeScript type checking does not replace running tests. The Node built-in test-runner fallback uses its JUnit reporter and requires Node.js 18.15 or later. When a supported runner dependency is declared, Polyguard invokes that runner's CLI and parses its recognized success summary. Project-defined npm `test` scripts are never treated as test-execution evidence.
 
 ### Monorepos and workspaces
 

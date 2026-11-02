@@ -72,8 +72,8 @@ DEFAULT_SUCCESS_PATTERNS = {
     ],
     # CTest's aggregate "100% tests passed" summary also appears when every
     # test is skipped via SKIP_RETURN_CODE. Count only per-test Passed records.
-    "c": [r"(?m)^\s*\d+/\d+\s+Test\s+#\d+:.*\bPassed\b"],
-    "cpp": [r"(?m)^\s*\d+/\d+\s+Test\s+#\d+:.*\bPassed\b"],
+    "c": [r"(?m)^\s*\d+/\d+\s+Test\s+#\d+:\s+.*\.\.\.\s+Passed\s+\d+(?:\.\d+)?\s+sec\s*$"],
+    "cpp": [r"(?m)^\s*\d+/\d+\s+Test\s+#\d+:\s+.*\.\.\.\s+Passed\s+\d+(?:\.\d+)?\s+sec\s*$"],
 }
 
 
@@ -750,27 +750,27 @@ def _javascript_junit_evidence(
     passed = 0
     for case in cases:
         name = case.attrib.get("name", "")
+        if not name:
+            continue
         # Node's JUnit reporter emits a passing testcase for a test file even
-        # when that file defines/runs no subtests. Exclude such file records.
-        if project_root is not None and name:
-            candidate = Path(name)
-            candidate = candidate if candidate.is_absolute() else project_root / candidate
-            try:
-                resolved = candidate.resolve()
-                within_root = _is_within(resolved, project_root.resolve())
-            except (OSError, RuntimeError):
-                within_root = False
-            is_test_file = (
-                within_root
-                and resolved.is_file()
-                and resolved.suffix.lower() in {".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx"}
-                and (
-                    _in_test_tree(project_root, resolved)
-                    or re.search(r"\.(test|spec)\.", resolved.name, re.I) is not None
-                )
-            )
-            if is_test_file:
-                continue
+        # when that file defines/runs no subtests. Classify paths lexically:
+        # the file may delete itself before the report is parsed.
+        candidate = Path(name)
+        if project_root is not None and not candidate.is_absolute():
+            candidate = project_root / candidate
+        is_javascript_file = candidate.suffix.lower() in {
+            ".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx",
+        }
+        in_test_tree = any(
+            part.lower() in {"test", "tests", "spec", "specs"}
+            for part in candidate.parts[:-1]
+        )
+        is_test_file = is_javascript_file and (
+            in_test_tree
+            or re.search(r"\.(test|spec)\.", candidate.name, re.I) is not None
+        )
+        if is_test_file:
+            continue
 
         child_names = {_xml_local_name(child.tag) for child in list(case)}
         if {"failure", "error", "skipped"}.intersection(child_names):

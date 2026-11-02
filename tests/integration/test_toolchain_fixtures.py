@@ -261,7 +261,8 @@ def test_node_file_without_executed_subtests_fails_closed(tmp_path: Path) -> Non
     _write(
         tmp_path,
         "tests/empty.test.js",
-        "console.log('fixture loaded');\n"
+        "const fs = require('node:fs');\n"
+        "fs.unlinkSync(__filename);\n"
         "process.exit(0);\n"
         "const test = require('node:test');\n"
         "test('must never run', () => { throw new Error('unexpected execution'); });\n",
@@ -279,10 +280,17 @@ def test_ctest_skip_only_fixture_fails_closed(tmp_path: Path, language: str) -> 
     _require_toolchains([language])
     _make_project(tmp_path, language)
 
-    test_name = "c_math" if language == "c" else "cpp_math"
+    original_test_name = "c_math" if language == "c" else "cpp_math"
+    test_name = "Passed"
     cmake_file = tmp_path / "CMakeLists.txt"
     cmake_text = cmake_file.read_text(encoding="utf-8")
-    assert f"add_test(NAME {test_name} COMMAND test_math)" in cmake_text
+    original_registration = f"add_test(NAME {original_test_name} COMMAND test_math)"
+    assert original_registration in cmake_text
+    cmake_text = cmake_text.replace(
+        original_registration,
+        f"add_test(NAME {test_name} COMMAND test_math)",
+        1,
+    )
     cmake_file.write_text(
         cmake_text + f"\nset_tests_properties({test_name} PROPERTIES SKIP_RETURN_CODE 77)\n",
         encoding="utf-8",

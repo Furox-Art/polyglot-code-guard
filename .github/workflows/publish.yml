@@ -15,6 +15,9 @@ jobs:
       id-token: write
     steps:
       - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
       - name: Verify release tag matches package version
         env:
           RELEASE_TAG: ${{ github.ref_name }}
@@ -31,9 +34,6 @@ jobs:
               raise SystemExit(f"Release tag {actual_tag!r} does not match package version {version!r}; expected {expected_tag!r}.")
           print(f"Verified {actual_tag} matches package version {version}.")
           PY
-      - uses: actions/setup-python@v7
-        with:
-          python-version: "3.12"
       - name: Install build tools
         run: python -m pip install --upgrade build
       - name: Build distributions

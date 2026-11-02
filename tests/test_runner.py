@@ -151,7 +151,17 @@ def test_go_json_evidence_counts_pass_events() -> None:
 def test_ctest_evidence_requires_real_passed_test_records() -> None:
     output = "1/1 Test #1: math ... Passed 0.00 sec\n100% tests passed, 0 tests failed out of 1"
     assert _execution_evidence("c", output)[0] == 1
-    assert _execution_evidence("cpp", "2/2 Test #1: a ... Passed\n2/2 Test #2: b ... Passed")[0] == 2
+    assert _execution_evidence(
+        "cpp",
+        "1/2 Test #1: a ... Passed 0.00 sec\n2/2 Test #2: b ... Passed 0.00 sec",
+    )[0] == 2
+
+    skipped_named_passed = (
+        "1/1 Test #1: Passed ...***Skipped 0.00 sec\n"
+        "100% tests passed, 0 tests failed out of 1"
+    )
+    assert _execution_evidence("c", skipped_named_passed)[0] is None
+    assert _execution_evidence("cpp", skipped_named_passed)[0] is None
 
     skipped_only = (
         "100% tests passed, 0 tests failed out of 1\n"
@@ -170,12 +180,16 @@ def test_ctest_evidence_requires_real_passed_test_records() -> None:
 
 
 def test_javascript_node_junit_requires_actual_subtest_records(tmp_path: Path) -> None:
-    empty_file = tmp_path / "empty.test.js"
+    test_dir = tmp_path / "tests"
+    test_dir.mkdir()
+    empty_file = test_dir / "empty.test.js"
     empty_file.write_text("process.exit(0);\n", encoding="utf-8")
+    # Node retains the file-level JUnit record even when a test deletes itself.
+    empty_file.unlink()
 
     empty_report = (
         '<?xml version="1.0" encoding="utf-8"?>'
-        '<testsuites><testcase name="empty.test.js" time="0.01" classname="test"/>'
+        '<testsuites><testcase name="tests/empty.test.js" time="0.01" classname="test"/>'
         '</testsuites>'
     )
     assert _execution_evidence("javascript", empty_report, tmp_path)[0] is None
@@ -188,7 +202,7 @@ def test_javascript_node_junit_requires_actual_subtest_records(tmp_path: Path) -
     assert _execution_evidence("javascript", real_report, tmp_path)[0] == 1
 
 
-def test_javascript_node_junit_rejects_invalid_and_skipped_reports(tmp_path: Path, monkeypatch) -> None:
+def test_javascript_node_junit_rejects_invalid_and_skipped_reports(tmp_path: Path) -> None:
     assert _execution_evidence("javascript", "runner emitted no report", tmp_path)[0] is None
     assert _execution_evidence("javascript", "<?xml version='1.0'?><testsuites>", tmp_path)[0] is None
     assert _execution_evidence("javascript", "<?xml version='1.0'?><unexpected/>", tmp_path)[0] is None
@@ -203,33 +217,29 @@ def test_javascript_node_junit_rejects_invalid_and_skipped_reports(tmp_path: Pat
     )
     assert _execution_evidence("javascript", failed_or_skipped, tmp_path)[0] is None
 
+    unnamed_case = (
+        '<?xml version="1.0" encoding="utf-8"?>'
+        '<testsuites><testcase time="0.01" classname="test"/></testsuites>'
+    )
+    assert _execution_evidence("javascript", unnamed_case, tmp_path)[0] is None
+
     passed_without_root = (
         '<?xml version="1.0" encoding="utf-8"?>'
         '<testsuites><testcase name="actual test"/></testsuites>'
     )
     assert _execution_evidence("javascript", passed_without_root)[0] == 1
 
-    outside_root = (
+    missing_file_record = (
         '<?xml version="1.0" encoding="utf-8"?>'
-        '<testsuites><testcase name="../outside.test.js"/></testsuites>'
+        '<testsuites><testcase name="tests/deleted.test.js"/></testsuites>'
     )
-    assert _execution_evidence("javascript", outside_root, tmp_path)[0] == 1
+    assert _execution_evidence("javascript", missing_file_record, tmp_path)[0] is None
 
-    broken_file = tmp_path / "broken.test.js"
-    broken_file.write_text("", encoding="utf-8")
-    original_resolve = Path.resolve
-
-    def fail_candidate_resolve(path: Path, *args, **kwargs):
-        if path.name == "broken.test.js":
-            raise OSError("simulated resolution failure")
-        return original_resolve(path, *args, **kwargs)
-
-    monkeypatch.setattr(Path, "resolve", fail_candidate_resolve)
-    broken_file_report = (
+    missing_spec_record = (
         '<?xml version="1.0" encoding="utf-8"?>'
-        '<testsuites><testcase name="broken.test.js"/></testsuites>'
+        '<testsuites><testcase name="outside.spec.ts"/></testsuites>'
     )
-    assert _execution_evidence("javascript", broken_file_report, tmp_path)[0] == 1
+    assert _execution_evidence("javascript", missing_spec_record, tmp_path)[0] is None
 
 
 def test_javascript_tap_evidence_requires_passing_tests() -> None:
