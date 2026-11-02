@@ -46,7 +46,7 @@ jobs:
         run: python -m pytest -q tests/test_runner.py
 
   swift-macos:
-    runs-on: macos-15
+    runs-on: macos-latest
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v7
