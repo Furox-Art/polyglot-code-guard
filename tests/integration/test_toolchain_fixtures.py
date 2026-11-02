@@ -7,6 +7,7 @@ toolchains and exercises this fixture matrix.
 
 from __future__ import annotations
 
+import json
 import shutil
 from pathlib import Path
 
@@ -103,7 +104,7 @@ def test_real_toolchain_fixture_passes(tmp_path: Path, language: str) -> None:
         pytest.skip(f"Required local toolchain for {language} is not installed.")
     _make_project(tmp_path, language)
     report = run_checks(tmp_path, timeout=180)
-    assert report["status"] == "PASS", report
+    assert report["status"] == "PASS", json.dumps(report, indent=2)
     assert len(report["results"]) == 1
     assert report["results"][0]["tests_passed"] and report["results"][0]["tests_passed"] > 0
     assert report["results"][0]["execution_evidence"]
@@ -115,8 +116,8 @@ def test_real_toolchain_fixture_fails_on_assertion(tmp_path: Path, language: str
         pytest.skip(f"Required local toolchain for {language} is not installed.")
     _make_project(tmp_path, language, failing=True)
     report = run_checks(tmp_path, timeout=180)
-    assert report["status"] == "FAIL", report
-    assert report["results"][0]["status"] == "FAIL", report
+    assert report["status"] == "FAIL", json.dumps(report, indent=2)
+    assert report["results"][0]["status"] == "FAIL", json.dumps(report, indent=2)
 
 
 def test_repository_fixture_directory_is_not_misdetected(tmp_path: Path) -> None:
