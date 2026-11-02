@@ -148,10 +148,88 @@ def test_go_json_evidence_counts_pass_events() -> None:
     assert _execution_evidence("go", json.dumps({"Action": "pass", "Package": "example"}))[0] is None
 
 
-def test_ctest_evidence_accepts_summary_and_per_test_format_without_double_counting() -> None:
+def test_ctest_evidence_requires_real_passed_test_records() -> None:
     output = "1/1 Test #1: math ... Passed 0.00 sec\n100% tests passed, 0 tests failed out of 1"
     assert _execution_evidence("c", output)[0] == 1
     assert _execution_evidence("cpp", "2/2 Test #1: a ... Passed\n2/2 Test #2: b ... Passed")[0] == 2
+
+    skipped_only = (
+        "100% tests passed, 0 tests failed out of 1\n"
+        "The following tests did not run:\n  1 - skipped_test (Skipped)"
+    )
+    assert _execution_evidence("c", skipped_only)[0] is None
+    assert _execution_evidence("cpp", skipped_only)[0] is None
+
+    mixed = (
+        "1/2 Test #1: passed_test ... Passed 0.00 sec\n"
+        "2/2 Test #2: skipped_test ... ***Skipped 0.00 sec\n"
+        "100% tests passed, 0 tests failed out of 2"
+    )
+    assert _execution_evidence("c", mixed)[0] == 1
+    assert _execution_evidence("cpp", mixed)[0] == 1
+
+
+def test_javascript_node_junit_requires_actual_subtest_records(tmp_path: Path) -> None:
+    empty_file = tmp_path / "empty.test.js"
+    empty_file.write_text("process.exit(0);\n", encoding="utf-8")
+
+    empty_report = (
+        '<?xml version="1.0" encoding="utf-8"?>'
+        '<testsuites><testcase name="empty.test.js" time="0.01" classname="test"/>'
+        '</testsuites>'
+    )
+    assert _execution_evidence("javascript", empty_report, tmp_path)[0] is None
+
+    real_report = (
+        '<?xml version="1.0" encoding="utf-8"?>'
+        '<testsuites><testcase name="addition works" time="0.01" classname="test"/>'
+        '</testsuites>'
+    )
+    assert _execution_evidence("javascript", real_report, tmp_path)[0] == 1
+
+
+def test_javascript_node_junit_rejects_invalid_and_skipped_reports(tmp_path: Path, monkeypatch) -> None:
+    assert _execution_evidence("javascript", "runner emitted no report", tmp_path)[0] is None
+    assert _execution_evidence("javascript", "<?xml version='1.0'?><testsuites>", tmp_path)[0] is None
+    assert _execution_evidence("javascript", "<?xml version='1.0'?><unexpected/>", tmp_path)[0] is None
+    assert _execution_evidence("javascript", "<?xml version='1.0'?><testsuites/>", tmp_path)[0] is None
+
+    failed_or_skipped = (
+        '<?xml version="1.0" encoding="utf-8"?>'
+        '<testsuites>'
+        '<testcase name="failed"><failure/></testcase>'
+        '<testcase name="skipped"><skipped/></testcase>'
+        '</testsuites>'
+    )
+    assert _execution_evidence("javascript", failed_or_skipped, tmp_path)[0] is None
+
+    passed_without_root = (
+        '<?xml version="1.0" encoding="utf-8"?>'
+        '<testsuites><testcase name="actual test"/></testsuites>'
+    )
+    assert _execution_evidence("javascript", passed_without_root)[0] == 1
+
+    outside_root = (
+        '<?xml version="1.0" encoding="utf-8"?>'
+        '<testsuites><testcase name="../outside.test.js"/></testsuites>'
+    )
+    assert _execution_evidence("javascript", outside_root, tmp_path)[0] == 1
+
+    broken_file = tmp_path / "broken.test.js"
+    broken_file.write_text("", encoding="utf-8")
+    original_resolve = Path.resolve
+
+    def fail_candidate_resolve(path: Path, *args, **kwargs):
+        if path.name == "broken.test.js":
+            raise OSError("simulated resolution failure")
+        return original_resolve(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "resolve", fail_candidate_resolve)
+    broken_file_report = (
+        '<?xml version="1.0" encoding="utf-8"?>'
+        '<testsuites><testcase name="broken.test.js"/></testsuites>'
+    )
+    assert _execution_evidence("javascript", broken_file_report, tmp_path)[0] == 1
 
 
 def test_javascript_tap_evidence_requires_passing_tests() -> None:
@@ -713,14 +791,20 @@ def test_javascript_ignores_arbitrary_npm_test_script(tmp_path: Path, monkeypatc
 
     def fake_run(command, *, cwd, **kwargs):
         calls.append(command)
-        return SimpleNamespace(returncode=0, stdout="# tests 1\n# pass 1\n# fail 0\n")
+        return SimpleNamespace(
+            returncode=0,
+            stdout=(
+                '<?xml version="1.0" encoding="utf-8"?>'
+                '<testsuites><testcase name="works" time="0.01" classname="test"/></testsuites>'
+            ),
+        )
 
     monkeypatch.setattr(runner, "_run_command", fake_run)
     monkeypatch.setattr(runner.shutil, "which", lambda executable: f"/fake/{executable}")
     report = runner.run_checks(tmp_path)
 
     assert report["status"] == "PASS", report
-    assert calls == [["node", "--test"]]
+    assert calls == [["node", "--test", "--test-reporter=junit"]]
     assert report["results"][0]["tests_passed"] == 1
 
 
@@ -1139,7 +1223,14 @@ def test_mixed_c_cpp_cmake_invocation_runs_once(tmp_path: Path, monkeypatch) -> 
     def fake_run(command, *, cwd, **kwargs):
         calls.append(command)
         if command[0] == "ctest":
-            return SimpleNamespace(returncode=0, stdout="100% tests passed, 0 tests failed out of 2\n")
+            return SimpleNamespace(
+                returncode=0,
+                stdout=(
+                    "1/2 Test #1: c_math ... Passed 0.00 sec\n"
+                    "2/2 Test #2: cpp_math ... Passed 0.00 sec\n"
+                    "100% tests passed, 0 tests failed out of 2\n"
+                ),
+            )
         return SimpleNamespace(returncode=0, stdout="")
 
     monkeypatch.setattr(runner, "_run_command", fake_run)

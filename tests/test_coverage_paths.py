@@ -85,9 +85,9 @@ def test_default_plans_handles_workspace_manifest(tmp_path):
 def test_default_plans_skips_invalid_javascript_packages_and_uses_node_test(tmp_path):
     (tmp_path / "package.json").write_text("{broken", encoding="utf-8")
     (tmp_path / "app.js").write_text("module.exports = 1", encoding="utf-8")
-    assert runner._default_plans(tmp_path)["javascript"] == [["node", "--test"]]
+    assert runner._default_plans(tmp_path)["javascript"] == [["node", "--test", "--test-reporter=junit"]]
     (tmp_path / "package.json").write_text("[]", encoding="utf-8")
-    assert runner._default_plans(tmp_path)["javascript"] == [["node", "--test"]]
+    assert runner._default_plans(tmp_path)["javascript"] == [["node", "--test", "--test-reporter=junit"]]
 
 
 def test_default_plans_recognizes_javascript_runners_and_typescript(tmp_path):

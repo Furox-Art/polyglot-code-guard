@@ -70,14 +70,10 @@ DEFAULT_SUCCESS_PATTERNS = {
         r"\bExecuted\s+(\d+)\s+tests?,\s+with\s+0\s+failures?\b",
         r"(?m)^.*Test run with (\d+) tests? in \d+ suites? passed\b",
     ],
-    "c": [
-        r"\b100%\s+tests passed,\s*0\s+tests? failed\s+out of\s+(\d+)\b",
-        r"(?m)^\s*\d+/\d+\s+Test\s+#\d+:.*\bPassed\b",
-    ],
-    "cpp": [
-        r"\b100%\s+tests passed,\s*0\s+tests? failed\s+out of\s+(\d+)\b",
-        r"(?m)^\s*\d+/\d+\s+Test\s+#\d+:.*\bPassed\b",
-    ],
+    # CTest's aggregate "100% tests passed" summary also appears when every
+    # test is skipped via SKIP_RETURN_CODE. Count only per-test Passed records.
+    "c": [r"(?m)^\s*\d+/\d+\s+Test\s+#\d+:.*\bPassed\b"],
+    "cpp": [r"(?m)^\s*\d+/\d+\s+Test\s+#\d+:.*\bPassed\b"],
 }
 
 
@@ -324,7 +320,7 @@ def _default_plans(root: Path, files: Iterable[Path] | None = None) -> dict[str,
             if name in runner_dependencies
         ]
         if not js_commands:
-            js_commands = [["node", "--test"]]
+            js_commands = [["node", "--test", "--test-reporter=junit"]]
         if "tsconfig.json" in names:
             js_commands.append(["npx", "--no-install", "tsc", "--noEmit"])
         plans["javascript"] = js_commands
@@ -734,11 +730,66 @@ def _matching_config_tests(
     return False
 
 
+def _javascript_junit_evidence(
+    output: str,
+    project_root: Path | None,
+) -> tuple[int | None, str]:
+    """Count actual Node test cases, not the file-level pass emitted for empty suites."""
+    xml_start = output.index("<?xml")
+    try:
+        document = ET.fromstring(output[xml_start:])
+    except ET.ParseError as exc:
+        return None, f"Node test runner emitted invalid JUnit XML: {exc}"
+    if _xml_local_name(document.tag) not in {"testsuites", "testsuite"}:
+        return None, "Node JUnit report has an unexpected root element."
+
+    cases = [node for node in document.iter() if _xml_local_name(node.tag) == "testcase"]
+    if not cases:
+        return None, "Node JUnit report contains no test-case records."
+
+    passed = 0
+    for case in cases:
+        name = case.attrib.get("name", "")
+        # Node's JUnit reporter emits a passing testcase for a test file even
+        # when that file defines/runs no subtests. Exclude such file records.
+        if project_root is not None and name:
+            candidate = Path(name)
+            candidate = candidate if candidate.is_absolute() else project_root / candidate
+            try:
+                resolved = candidate.resolve()
+                within_root = _is_within(resolved, project_root.resolve())
+            except (OSError, RuntimeError):
+                within_root = False
+            is_test_file = (
+                within_root
+                and resolved.is_file()
+                and resolved.suffix.lower() in {".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx"}
+                and (
+                    _in_test_tree(project_root, resolved)
+                    or re.search(r"\.(test|spec)\.", resolved.name, re.I) is not None
+                )
+            )
+            if is_test_file:
+                continue
+
+        child_names = {_xml_local_name(child.tag) for child in list(case)}
+        if {"failure", "error", "skipped"}.intersection(child_names):
+            continue
+        passed += 1
+
+    if passed:
+        return passed, f"Node JUnit report: {passed} passing test case(s)."
+    return None, "Node JUnit report contained no passing test cases outside test-file records."
+
+
 def _execution_evidence(
     language: str,
     output: str,
+    project_root: Path | None = None,
 ) -> tuple[int | None, str]:
     """Parse a positive successful-test count from a built-in runner summary."""
+    if language == "javascript" and "<?xml" in output:
+        return _javascript_junit_evidence(output, project_root)
     if language == "go":
         passed = 0
         for line in output.splitlines():
@@ -1295,6 +1346,7 @@ def run_checks(
                 tests_passed, execution_evidence = _execution_evidence(
                     language,
                     combined_output,
+                    unit.root,
                 )
                 if tests_passed is None:
                     passed = False

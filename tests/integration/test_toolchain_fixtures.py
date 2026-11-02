@@ -254,6 +254,54 @@ def test_real_toolchain_fixture_fails_on_assertion(tmp_path: Path, language: str
     assert "POLYGUARD_EXPECTED_ASSERTION_FAILURE" in result["output"], json.dumps(report, indent=2)
 
 
+def test_node_file_without_executed_subtests_fails_closed(tmp_path: Path) -> None:
+    """Node's file-level pass is not evidence that a test case ran."""
+    _require_toolchains(["javascript"])
+    _write(tmp_path, "package.json", '{"name":"polyguard-node-empty-fixture","version":"1.0.0"}\n')
+    _write(
+        tmp_path,
+        "tests/empty.test.js",
+        "console.log('fixture loaded');\n"
+        "process.exit(0);\n"
+        "const test = require('node:test');\n"
+        "test('must never run', () => { throw new Error('unexpected execution'); });\n",
+    )
+    report = run_checks(tmp_path, timeout=60)
+    assert report["status"] == "FAIL", json.dumps(report, indent=2)
+    result = report["results"][0]
+    assert result["exit_code"] == 0
+    assert "no passing test cases" in result["execution_evidence"].lower()
+
+
+@pytest.mark.parametrize("language", ["c", "cpp"])
+def test_ctest_skip_only_fixture_fails_closed(tmp_path: Path, language: str) -> None:
+    """CTest returns zero for SKIP_RETURN_CODE; skipped cases must not prove PASS."""
+    _require_toolchains([language])
+    _make_project(tmp_path, language)
+
+    test_name = "c_math" if language == "c" else "cpp_math"
+    cmake_file = tmp_path / "CMakeLists.txt"
+    cmake_text = cmake_file.read_text(encoding="utf-8")
+    assert f"add_test(NAME {test_name} COMMAND test_math)" in cmake_text
+    cmake_file.write_text(
+        cmake_text + f"\nset_tests_properties({test_name} PROPERTIES SKIP_RETURN_CODE 77)\n",
+        encoding="utf-8",
+    )
+
+    source_file = tmp_path / ("tests/test_math.c" if language == "c" else "tests/test_math.cpp")
+    source_text = source_file.read_text(encoding="utf-8")
+    assert source_text.count("return 0;") == 1
+    source_file.write_text(source_text.replace("return 0;", "return 77;"), encoding="utf-8")
+
+    report = run_checks(tmp_path, timeout=240)
+    assert report["status"] == "FAIL", json.dumps(report, indent=2)
+    result = report["results"][0]
+    assert result["status"] == "FAIL"
+    assert result["exit_code"] == 0, json.dumps(report, indent=2)
+    assert "Skipped" in result["output"]
+    assert result["tests_passed"] is None
+
+
 def test_repository_fixture_directory_is_not_misdetected(tmp_path: Path) -> None:
     from polyguard.runner import _project_files
 
