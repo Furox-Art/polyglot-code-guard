@@ -45,6 +45,9 @@ DEFAULT_SUCCESS_PATTERNS = {
         r"(?im)^\s*#\s*pass\s+(\d+)\s*$",
         r"(?im)^\s*ℹ\s+pass\s+(\d+)\s*$",
         r"(?im)^Tests:\s*(\d+)\s+passed\b",
+        # Vitest's default/minimal reporters include a test-level summary:
+        # "Tests 16 passed | 4 skipped (20)". Do not count "Test Files".
+        r"(?im)^\s*Tests\s+(\d+)\s+passed(?:\s*\|[^\r\n]*)?\s+\(\d+\)\s*$",
         r"\b(\d+)\s+passing\b",
     ],
     "java": [
@@ -562,29 +565,12 @@ def _discover_project_units(
         if uncovered:
             units.add(ProjectUnit(root, language))
 
-    candidates = sorted(units, key=lambda unit: (str(unit.root), unit.language))
-    filtered: list[ProjectUnit] = []
-    for unit in candidates:
-        has_nested_same_language = any(
-            other.language == unit.language
-            and other.root != unit.root
-            and _is_within(other.root, unit.root)
-            for other in candidates
-        )
-        if has_nested_same_language:
-            language_config = (configured or {}).get(unit.language)
-            local_files = _files_for_unit(root, unit, candidates, files)
-            if language_config:
-                has_local_tests = _matching_config_tests(
-                    unit.root, language_config.test_patterns, local_files
-                )
-            else:
-                has_local_tests = _has_test(local_files, unit.language, unit.root)
-            if not has_local_tests:
-                continue
-        filtered.append(unit)
-
-    return filtered
+    # Keep every independently declared project root. A parent manifest is not
+    # evidence of a workspace/aggregator: if it has no local tests, run_checks()
+    # must report that project as FAIL instead of silently dropping it merely
+    # because a nested package has tests. Known native aggregators were handled
+    # explicitly above.
+    return sorted(units, key=lambda unit: (str(unit.root), unit.language))
 
 def _files_for_unit(
     root: Path, unit: ProjectUnit, units: list[ProjectUnit], files: list[Path] | None = None
@@ -953,15 +939,12 @@ def run_checks(
         default_commands = _default_plans(unit.root, unit_files).get(language, [])
         language_config = configured.get(language)
         commands = language_config.commands if language_config else default_commands
+        # User-defined commands are executable project input, not trusted test
+        # evidence. Only the built-in command plan may earn PASS from recognized
+        # stdout summaries or native reports; otherwise a command can simply
+        # print a forged "1 passed" line and exit zero.
+        custom_commands = language_config is not None and commands != default_commands
         project_root = str(unit.root)
-
-        if not commands:
-            results.append(CheckResult(
-                language, "FAIL", [], 2, 0.0,
-                "Language was required by configuration but no check commands were provided.",
-                project_root=project_root,
-            ))
-            continue
 
         if language_config:
             has_tests = _matching_config_tests(unit.root, language_config.test_patterns)
@@ -972,6 +955,14 @@ def run_checks(
         if not has_tests:
             results.append(CheckResult(
                 language, "FAIL", commands, 2, 0.0, test_reason,
+                project_root=project_root,
+            ))
+            continue
+
+        if not commands:
+            results.append(CheckResult(
+                language, "FAIL", [], 2, 0.0,
+                "Language was required by configuration but no check commands were provided.",
                 project_root=project_root,
             ))
             continue
@@ -1050,6 +1041,13 @@ def run_checks(
         elapsed = time.monotonic() - started
         combined_output = "\n".join(output_parts)[-12000:]
         passed = last_code == 0 and not failure_reason
+        if passed and custom_commands:
+            passed = False
+            failure_reason = (
+                "Custom commands cannot establish trusted test-execution evidence. "
+                "Use the built-in command plan; custom command output and generated "
+                "reports are not accepted as proof of test execution."
+            )
         tests_passed: int | None = None
         tests_failed: int | None = None
         tests_skipped: int | None = None

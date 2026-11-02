@@ -49,7 +49,7 @@ Exit code is **0** for PASS and **1** for FAIL. Missing tests, missing toolchain
 | Python | \`compileall\`, then \`pytest -q\` | Pytest passed-test summary |
 | Rust | \`cargo test --all-targets\` | Cargo test-result summary |
 | Go | \`go test -json ./...\` | Passing test events in JSON stream |
-| JavaScript / TypeScript | \`npm test\`; TypeScript also runs \`tsc --noEmit\` when configured | Recognized runner pass summary |
+| JavaScript / TypeScript | \`npm test\`; TypeScript also runs \`tsc --noEmit\` when configured | Recognized runner pass summary (including Vitest default/minimal, Jest, Mocha, and Node TAP formats) |
 | Java | Maven `clean test` or Gradle `clean test` | Parsed Surefire/Gradle JUnit XML; at least one pass, zero failures |
 | C# | dotnet test with a Polyguard TRX prefix | Parsed TRX counters; at least one pass, zero failures |
 | PHP | PHPUnit with --log-junit | Parsed JUnit XML; at least one pass, zero failures |
@@ -91,15 +91,16 @@ Configuration fields:
 - \`commands\`: non-empty argument arrays. Commands are launched without a shell.
 - \`test_patterns\`: at least one matching file must exist inside the project root.
 
-**Evidence boundary:** custom \`success_patterns\` are rejected. An arbitrary output regex can be satisfied by a dummy command and cannot establish that tests executed. Custom commands must emit a recognized built-in runner summary. Java and PHP additionally require fresh JUnit XML reports; C# requires a fresh TRX report generated during the current run. Swift uses its native test-runner summary. Unsupported custom output formats fail closed; they cannot be promoted to PASS with a user-supplied regex.
+**Evidence boundary:** custom \`success_patterns\` are rejected. An arbitrary output regex can be satisfied by a dummy command and cannot establish that tests executed. Custom commands may execute for diagnostics, but they cannot establish PASS: their stdout and generated reports are not trusted execution evidence. PASS requires the exact built-in command plan for the detected language project. A custom command adapter is not currently supported.
 
 ## Test evidence and verdict rules
 
 A language check returns PASS only when:
 1. The project and required test suite are detected.
 2. Every required command completes successfully.
-3. A built-in runner summary or a freshly generated native structured test report proves that at least one test passed.
-4. No command failure or timeout occurs.
+3. The exact built-in command plan for the detected project ran; custom commands cannot establish PASS.
+4. A built-in runner summary or a freshly generated native structured test report proves that at least one test passed.
+5. No command failure or timeout occurs.
 
 A zero-test run, an all-skipped suite, an output with no recognized success summary, inconsistent report counters, a malformed or stale native report, or a non-zero exit code returns FAIL. Java and PHP require freshly generated JUnit XML; C# requires a fresh TRX report. Swift uses a positive test count from the SwiftPM runner summary because Swift Testing does not produce a usable xUnit report in this workflow. A successful command exit alone is insufficient. C# currently targets the VSTest TRX logger contract; Microsoft.Testing.Platform projects that do not emit this TRX report fail closed until an MTP-specific adapter is configured. JSON and detailed output include passed, failed, skipped, and total counts when the runner report exposes them.
 
@@ -126,11 +127,11 @@ Agents must not report successful verification unless the command exits 0 and re
 
 ## Important limitations and security
 
-Polyguard is a test-execution gate, **not a formal proof of program correctness**. PASS means that the configured commands succeeded and a positive test-pass summary was recognized. It does not guarantee adequate test coverage, correct requirements, absence of defects, or trustworthy user-defined commands/patterns.
+Polyguard is a test-execution gate, **not a formal proof of program correctness**. PASS means that the built-in command plan succeeded and positive test-pass evidence was recognized. It does not guarantee adequate test coverage, correct requirements, or absence of defects.
 
 The verifier executes project build scripts, package managers, and tests. Treat repositories and dependencies as untrusted. Run them in a disposable container or VM without secrets, privileged access, or sensitive host mounts. Polyguard does not itself provide operating-system isolation.
 
-Automatic language discovery is conservative. Custom frameworks can use explicit commands, but PASS still requires a built-in runner summary or a supported native structured report. Polyguard discovers supported package manifests recursively and executes each discovered language package from its own project root. Multiple packages using the same language are reported separately; the overall result is FAIL if any package fails. A root-level .polyguard.toml applies its language configuration to each matching package, with test patterns evaluated relative to that package root. Workspace-specific dependency orchestration remains the responsibility of the native package manager.
+Automatic language discovery is conservative. Custom frameworks can be configured for diagnostic execution, but custom commands cannot establish PASS. Only the built-in command plan currently produces trusted execution evidence. Polyguard discovers supported package manifests recursively and executes each discovered language package from its own project root. Multiple packages using the same language are reported separately; the overall result is FAIL if any package fails. A root-level .polyguard.toml applies its language configuration to each matching package, with test patterns evaluated relative to that package root. Workspace-specific dependency orchestration remains the responsibility of the native package manager.
 
 ## Development
 

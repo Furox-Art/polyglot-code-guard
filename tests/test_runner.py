@@ -130,6 +130,17 @@ def test_javascript_tap_evidence_requires_passing_tests() -> None:
     assert _execution_evidence("javascript", "# tests 2\n# pass 0\n# fail 0")[0] is None
 
 
+def test_javascript_vitest_summary_requires_positive_test_count() -> None:
+    default_reporter = "Test Files  4 passed (4)\n     Tests  16 passed | 4 skipped (20)"
+    minimal_reporter = "Tests 2 passed (2)"
+    zero_passed = "Test Files 1 passed (1)\nTests 0 passed | 5 skipped (5)"
+    file_count_only = "Test Files 3 passed (3)"
+    assert _execution_evidence("javascript", default_reporter)[0] == 16
+    assert _execution_evidence("javascript", minimal_reporter)[0] == 2
+    assert _execution_evidence("javascript", zero_passed)[0] is None
+    assert _execution_evidence("javascript", file_count_only)[0] is None
+
+
 def test_custom_config_requires_execution_evidence(tmp_path: Path) -> None:
     (tmp_path / "app.py").write_text("print('app')\n", encoding="utf-8")
     tests_dir = tmp_path / "custom-tests"
@@ -138,13 +149,13 @@ def test_custom_config_requires_execution_evidence(tmp_path: Path) -> None:
     config = tmp_path / ".polyguard.toml"
     config.write_text(
         "[checks.python]\n"
-        f"commands = [[{sys.executable!r}, '-c', \"print('custom command passed')\"]]\n"
+        f"commands = [[{sys.executable!r}, '-c', \"print('1 passed in 0.01s')\"]]\n"
         "test_patterns = ['custom-tests/*.case']\n",
         encoding="utf-8",
     )
     report = run_checks(tmp_path)
     assert report["status"] == "FAIL"
-    assert "could not verify" in report["results"][0]["reason"].lower()
+    assert "custom commands cannot establish trusted" in report["results"][0]["reason"].lower()
 
 
 def test_custom_success_patterns_cannot_manufacture_pass(tmp_path: Path) -> None:
@@ -387,11 +398,11 @@ def test_one_failing_package_makes_monorepo_fail(tmp_path: Path, monkeypatch) ->
     assert {item["status"] for item in report["results"]} == {"PASS", "FAIL"}
 
 
-def test_monorepo_workspace_manifest_does_not_create_empty_parent_unit(tmp_path: Path, monkeypatch) -> None:
+def test_tests_missing_from_parent_project_is_not_hidden_by_nested_package(tmp_path: Path, monkeypatch) -> None:
     from types import SimpleNamespace
     import polyguard.runner as runner
 
-    (tmp_path / "pyproject.toml").write_text("[project]\nname = 'workspace'\n", encoding="utf-8")
+    (tmp_path / "pyproject.toml").write_text("[project]\nname = 'parent'\n", encoding="utf-8")
     package = tmp_path / "packages" / "api"
     package.mkdir(parents=True)
     (package / "pyproject.toml").write_text("[project]\nname = 'api'\n", encoding="utf-8")
@@ -407,9 +418,12 @@ def test_monorepo_workspace_manifest_does_not_create_empty_parent_unit(tmp_path:
     )
     report = run_checks(tmp_path)
 
-    assert report["status"] == "PASS", report
-    assert len(report["results"]) == 1
-    assert Path(report["results"][0]["project_root"]) == package
+    assert report["status"] == "FAIL", report
+    results = {Path(item["project_root"]): item for item in report["results"]}
+    assert set(results) == {tmp_path, package}
+    assert results[tmp_path]["status"] == "FAIL"
+    assert "no test suite" in results[tmp_path]["reason"].lower()
+    assert results[package]["status"] == "PASS"
 
 
 def test_parent_python_package_does_not_execute_nested_package_tests(tmp_path: Path, monkeypatch) -> None:

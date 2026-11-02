@@ -12,7 +12,7 @@ Use this skill whenever code is generated, changed, refactored, or described as 
 1. Identify every language, build system, package root, and test framework touched by the change.
 2. Add requirement-based tests for normal behavior, edge cases, invalid inputs, error paths, and regressions.
 3. Run \`polyguard verify --path . --details\`.
-4. For a non-standard test runner, configure explicit commands, file patterns, and a success-summary parser in \`.polyguard.toml\`.
+4. For a non-standard test runner, explicit commands and file patterns can be configured for diagnostics; custom commands cannot establish PASS until a trusted runner adapter is implemented.
 5. Run the complete configured test suite. Do not omit a detected or required language.
 6. Require a positive passed-test count in recognized runner output. Java and PHP default checks must produce fresh JUnit XML; C# must produce a fresh TRX report. Swift must emit a positive native test-runner summary. A successful command exit code alone is not sufficient.
 7. If a command fails, a toolchain is missing, tests cannot be found, the runner reports no passing tests, execution times out, or output evidence is missing, the verdict is FAIL.
@@ -28,7 +28,7 @@ The CLI exits 0 only for PASS and 1 for FAIL. Default output is exactly one word
 
 ## Custom command trust
 
-Custom \`success_patterns\` are rejected because arbitrary output regexes can manufacture a false PASS. Custom commands may emit recognized runner-summary text, but that text is not cryptographic proof of execution and can be spoofed by the command itself. Treat custom command configuration as trusted project input. Java, C#, and PHP additionally require fresh native reports; Swift uses its runner summary.
+Custom \`success_patterns\` are rejected. Custom commands may execute for diagnostics, but their output and generated reports cannot establish PASS because a command can forge them. Only the exact built-in command plan for the detected project is accepted as execution evidence. Java, C#, and PHP additionally require fresh native reports; Swift uses its runner summary.
 
 ## Scope
 
