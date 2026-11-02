@@ -113,7 +113,7 @@ python -m pip install -e ".[test]"
 python -m pytest -q
 \`\`\`
 
-Integration fixtures are created in temporary directories and run through Polyguard's actual project discovery and command execution path. Missing local toolchains are skipped by local integration tests; required CI jobs install their toolchains explicitly. The CI workflow also runs runner unit tests on Linux, Windows, and macOS, plus a native SwiftPM fixture on macOS.
+Integration fixtures are created in temporary directories and run through Polyguard's actual project discovery and command execution path. All required local toolchains must be installed; missing toolchains make the corresponding integration tests fail rather than skip. The repository-wide pytest hook also fails the session if any test is skipped. The native-integration CI job verifies toolchain availability and runs the complete fixture suite. The CI workflow also runs runner tests on Linux, Windows, and macOS, plus a dedicated SwiftPM fixture on macOS.
 
 ## AI coding-agent skill
 
