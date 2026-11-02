@@ -46,37 +46,53 @@ def _in_test_tree(path: Path) -> bool:
 
 
 def _has_test(files: Iterable[Path], language: str) -> bool:
-    for path in files:
+    """Require a recognizable test declaration, not merely a file named like a test."""
+    all_files = list(files)
+    for path in all_files:
         name = path.name.lower()
         suffix = path.suffix.lower()
+        content = _safe_read(path)
+
         if language == "python" and suffix == ".py":
-            if _in_test_tree(path) or name.startswith("test_") or name.endswith("_test.py"):
+            is_test_file = _in_test_tree(path) or name.startswith("test_") or name.endswith("_test.py")
+            if is_test_file and re.search(r"\b(?:def\s+test_\w+\s*\(|class\s+Test\w*)", content):
                 return True
         elif language == "rust" and suffix == ".rs":
-            if _in_test_tree(path) or re.search(r"#\s*\[\s*test\s*\]", _safe_read(path)):
+            if re.search(r"#\s*\[\s*(?:test|tokio::test|async_std::test)\s*\]", content):
                 return True
         elif language == "javascript" and suffix in {".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx"}:
-            if _in_test_tree(path) or re.search(r"\.(test|spec)\.", name):
+            is_test_file = _in_test_tree(path) or re.search(r"\.(test|spec)\.", name)
+            if is_test_file and re.search(r"\b(?:test|it|specify)\s*(?:\.\w+)?\s*\(", content):
                 return True
         elif language == "go" and name.endswith("_test.go"):
-            return True
+            if re.search(r"\bfunc\s+Test[A-Z]\w*\s*\(", content):
+                return True
         elif language == "java" and suffix == ".java":
-            if _in_test_tree(path) or name.endswith(("test.java", "tests.java")):
+            is_test_file = _in_test_tree(path) or name.endswith(("test.java", "tests.java"))
+            if is_test_file and re.search(r"@(?:Test|ParameterizedTest|RepeatedTest|TestFactory|TestTemplate)\b", content):
                 return True
         elif language == "csharp" and suffix == ".cs":
-            if _in_test_tree(path) or name.endswith(("tests.cs", "test.cs")):
+            if re.search(r"\[(?:Fact|Theory|Test|TestCase|TestMethod)\b", content):
                 return True
         elif language == "php" and suffix == ".php":
-            if _in_test_tree(path) or name.startswith("test"):
+            is_test_file = _in_test_tree(path) or name.startswith("test")
+            if is_test_file and re.search(r"(?:function\s+test\w*\s*\(|#\[Test\])", content, re.I):
                 return True
         elif language == "ruby" and suffix == ".rb":
-            if _in_test_tree(path) or name.startswith("test_") or name.endswith("_spec.rb"):
+            is_test_file = _in_test_tree(path) or name.startswith("test_") or name.endswith("_spec.rb")
+            if is_test_file and re.search(r"\b(?:it|specify|example)\s+['\"].+?\bdo\b|\bdef\s+test_\w+", content, re.S):
                 return True
-        elif language == "swift" and suffix == ".swift" and _in_test_tree(path):
-            return True
+        elif language == "swift" and suffix == ".swift":
+            if _in_test_tree(path) and re.search(r"(?:\bfunc\s+test\w*\s*\(|@Test\b)", content):
+                return True
         elif language == "cpp" and suffix in {".c", ".cc", ".cpp", ".cxx", ".h", ".hpp"}:
-            if _in_test_tree(path) or "test" in name:
-                return True
+            if (_in_test_tree(path) or "test" in name) and re.search(r"\b(?:TEST|TEST_F|TEST_P|TEST_CASE)\s*\(", content):
+                cmake_files = [p for p in all_files if p.name.lower() == "cmakelists.txt"]
+                cmake_text = "\n".join(_safe_read(p) for p in cmake_files)
+                enabled = re.search(r"\b(?:enable_testing)\s*\(|\binclude\s*\(\s*CTest\b", cmake_text, re.I)
+                registered = re.search(r"\b(?:add_test|gtest_discover_tests|catch_discover_tests)\s*\(", cmake_text)
+                if enabled and registered:
+                    return True
     return False
 
 
