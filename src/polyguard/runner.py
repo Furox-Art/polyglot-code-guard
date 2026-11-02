@@ -59,8 +59,14 @@ DEFAULT_SUCCESS_PATTERNS = {
         r"\b(\d+)\s+runs?,\s+\d+\s+assertions?,\s+0\s+failures?,\s+0\s+errors?,\s+0\s+skips?\b",
     ],
     "swift": [r"\bExecuted\s+(\d+)\s+tests?,\s+with\s+0\s+failures?\b"],
-    "c": [r"\b100%\s+tests passed,\s*0\s+tests? failed\s+out of\s+(\d+)\b"],
-    "cpp": [r"\b100%\s+tests passed,\s*0\s+tests? failed\s+out of\s+(\d+)\b"],
+    "c": [
+        r"\b100%\s+tests passed,\s*0\s+tests? failed\s+out of\s+(\d+)\b",
+        r"(?m)^\s*\d+/\d+\s+Test\s+#\d+:.*\bPassed\b",
+    ],
+    "cpp": [
+        r"\b100%\s+tests passed,\s*0\s+tests? failed\s+out of\s+(\d+)\b",
+        r"(?m)^\s*\d+/\d+\s+Test\s+#\d+:.*\bPassed\b",
+    ],
 }
 
 
@@ -378,20 +384,24 @@ def _execution_evidence(
         return None, "go test JSON contained no passing test events."
 
     patterns = success_patterns or DEFAULT_SUCCESS_PATTERNS.get(language, [])
-    total = 0
-    matched: list[str] = []
+    counts: list[tuple[str, int]] = []
     for pattern in patterns:
+        count_for_pattern = 0
         for match in re.finditer(pattern, output):
             try:
                 count = int(match.group(1)) if match.lastindex else 1
             except (TypeError, ValueError):
                 count = 0
             if count > 0:
-                total += count
-                matched.append(pattern)
-    if total <= 0:
+                count_for_pattern += count
+        if count_for_pattern > 0:
+            counts.append((pattern, count_for_pattern))
+    if not counts:
         return None, "No positive successful-test count was found in runner output."
-    return total, f"Matched {len(set(matched))} execution-evidence pattern(s); {total} test(s) reported passing."
+    # Alternative summary and per-test output patterns may describe the same
+    # tests; take the strongest single count rather than double-counting them.
+    total = max(count for _, count in counts)
+    return total, f"Matched {len(counts)} execution-evidence pattern(s); {total} test(s) reported passing."
 
 
 def _failure_report(reason: str, language: str = "configuration") -> dict:

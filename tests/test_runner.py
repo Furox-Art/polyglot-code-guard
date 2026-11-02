@@ -117,6 +117,12 @@ def test_go_json_evidence_counts_pass_events() -> None:
     assert _execution_evidence("go", json.dumps({"Action": "pass", "Package": "example"}))[0] is None
 
 
+def test_ctest_evidence_accepts_summary_and_per_test_format_without_double_counting() -> None:
+    output = "1/1 Test #1: math ... Passed 0.00 sec\n100% tests passed, 0 tests failed out of 1"
+    assert _execution_evidence("c", output)[0] == 1
+    assert _execution_evidence("cpp", "2/2 Test #1: a ... Passed\n2/2 Test #2: b ... Passed")[0] == 2
+
+
 def test_javascript_tap_evidence_requires_passing_tests() -> None:
     assert _execution_evidence("javascript", "# tests 2\n# pass 2\n# fail 0")[0] == 2
     assert _execution_evidence("javascript", "# tests 2\n# pass 0\n# fail 0")[0] is None
