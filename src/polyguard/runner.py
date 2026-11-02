@@ -14,6 +14,7 @@ import time
 import xml.etree.ElementTree as ET
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
+from threading import Thread
 from typing import Iterable
 
 try:
@@ -143,7 +144,14 @@ def _project_files(root: Path) -> list[Path]:
         )
         current_path = Path(current)
         found.extend(current_path / name for name in filenames)
-    return sorted(path for path in found if _is_within(path.resolve(), root))
+    safe_files = []
+    for path in found:
+        try:
+            if _is_within(path.resolve(), root):
+                safe_files.append(path)
+        except (OSError, RuntimeError):
+            continue
+    return sorted(safe_files)
 
 
 def _in_test_tree(root: Path, path: Path) -> bool:
@@ -719,7 +727,7 @@ def _matching_config_tests(
                     continue
                 if allowed is None or path.resolve() in allowed:
                     return True
-        except (OSError, ValueError):
+        except (OSError, ValueError, RuntimeError):
             continue
     return False
 
@@ -738,7 +746,23 @@ def _execution_evidence(
                 continue
             if not isinstance(event, dict):
                 return None, "go test JSON event must be an object."
-            if event.get("Action") == "pass" and isinstance(event.get("Test"), str) and event.get("Test"):
+            action = event.get("Action")
+            if not isinstance(action, str) or action not in {
+                "start", "run", "pause", "cont", "pass", "bench", "fail",
+                "output", "skip",
+            }:
+                return None, "go test JSON event has an invalid Action field."
+            if "Package" in event and not isinstance(event["Package"], str):
+                return None, "go test JSON event has an invalid Package field."
+            if "Test" in event and not isinstance(event["Test"], str):
+                return None, "go test JSON event has an invalid Test field."
+            if "Elapsed" in event and (
+                isinstance(event["Elapsed"], bool)
+                or not isinstance(event["Elapsed"], (int, float))
+                or event["Elapsed"] < 0
+            ):
+                return None, "go test JSON event has an invalid Elapsed field."
+            if action == "pass" and isinstance(event.get("Test"), str) and event.get("Test"):
                 passed += 1
         if passed:
             return passed, f"go test JSON: {passed} passing test event(s)"
@@ -763,6 +787,9 @@ def _execution_evidence(
     # tests; take the strongest single count rather than double-counting them.
     total = max(count for _, count in counts)
     return total, f"Matched {len(counts)} execution-evidence pattern(s); {total} test(s) reported passing."
+
+
+MAX_COMMAND_OUTPUT_BYTES = 256 * 1024
 
 
 NATIVE_REPORT_LANGUAGES = {"java", "csharp", "php"}
@@ -803,6 +830,22 @@ def _parse_junit_xml(path: Path) -> tuple[int, int, int]:
         ]
         if counters["tests"] != len(suite_cases):
             raise ValueError("JUnit testsuite test counter does not match testcase records.")
+        actual_failures = sum(
+            any(_xml_local_name(child.tag) == "failure" for child in list(case))
+            for case in suite_cases
+        )
+        actual_errors = sum(
+            any(_xml_local_name(child.tag) == "error" for child in list(case))
+            for case in suite_cases
+        )
+        actual_skipped = sum(
+            any(_xml_local_name(child.tag) == "skipped" for child in list(case))
+            for case in suite_cases
+        )
+        if counters["failures"] != actual_failures or counters["errors"] != actual_errors:
+            raise ValueError("JUnit failure/error counters do not match testcase records.")
+        if counters["skipped"] != actual_skipped:
+            raise ValueError("JUnit skipped counter does not match testcase records.")
         cases.extend(suite_cases)
     tests = len(cases)
     failures = skipped = 0
@@ -820,18 +863,18 @@ def _parse_trx(path: Path) -> tuple[int, int, int]:
     root = ET.parse(path).getroot()
     if _xml_local_name(root.tag) != "testrun":
         raise ValueError("TRX root element must be TestRun.")
-    counters = next(
-        (
-            node for summary in list(root)
-            if _xml_local_name(summary.tag) == "resultsummary"
-            for node in list(summary) if _xml_local_name(node.tag) == "counters"
-        ),
-        None,
-    )
-    if counters is None:
-        raise ValueError("TRX report has no ResultSummary/Counters element.")
+    summaries = [node for node in list(root) if _xml_local_name(node.tag) == "resultsummary"]
+    if len(summaries) != 1:
+        raise ValueError("TRX report must contain exactly one ResultSummary.")
+    counter_nodes = [node for node in list(summaries[0]) if _xml_local_name(node.tag) == "counters"]
+    if len(counter_nodes) != 1:
+        raise ValueError("TRX ResultSummary must contain exactly one Counters element.")
+    counters = counter_nodes[0]
     attrs = {key.lower(): value for key, value in counters.attrib.items()}
-    if not attrs.get("total", "").isdigit(): raise ValueError("TRX total counter is invalid.")
+    if any(not attrs.get(key, "").isdigit() for key in ("total", "passed", "failed")):
+        raise ValueError("TRX required counters are missing or invalid.")
+    if any(not value.isdigit() for value in attrs.values()):
+        raise ValueError("TRX counters contain a negative or non-integer value.")
     total = _as_nonnegative_int(attrs.get("total"))
     passed = _as_nonnegative_int(attrs.get("passed"))
     failed = sum(
@@ -849,6 +892,27 @@ def _parse_trx(path: Path) -> tuple[int, int, int]:
             "TRX counters do not reconcile: "
             f"total={total}, passed={passed}, failed={failed}, skipped={skipped}."
         )
+    result_collections = [node for node in list(root) if _xml_local_name(node.tag) == "results"]
+    if len(result_collections) != 1:
+        raise ValueError("TRX TestRun must contain exactly one Results collection.")
+    result_nodes = list(result_collections[0])
+    if any(_xml_local_name(node.tag) != "unittestresult" for node in result_nodes):
+        raise ValueError("TRX Results contains an unexpected child element.")
+    actual = {"passed": 0, "failed": 0, "skipped": 0}
+    for result in result_nodes:
+        outcome = result.attrib.get("outcome", "").lower()
+        if outcome == "passed":
+            actual["passed"] += 1
+        elif outcome in {"failed", "error", "aborted", "timeout", "passedbutrunaborted", "disconnected"}:
+            actual["failed"] += 1
+        elif outcome in {"notexecuted", "inconclusive", "notrunnable"}:
+            actual["skipped"] += 1
+        else:
+            raise ValueError(f"TRX UnitTestResult has an unknown outcome: {outcome!r}.")
+    if len(result_nodes) != total or (
+        actual["passed"] != passed or actual["failed"] != failed or actual["skipped"] != skipped
+    ):
+        raise ValueError("TRX UnitTestResult records do not match Counters.")
     return total, failed, skipped
 
 
@@ -1003,26 +1067,59 @@ def _run_command(
     cwd: Path,
     timeout: int,
 ) -> subprocess.CompletedProcess[str]:
-    """Run one command, cleaning up its process tree when the timeout expires."""
+    """Run one command with bounded output capture and process-tree timeout cleanup."""
     process = subprocess.Popen(
         command,
         cwd=cwd,
-        text=True,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         shell=False,
         start_new_session=(os.name == "posix"),
     )
+    output_tail = bytearray()
+    reader_errors: list[OSError] = []
+
+    def drain_output() -> None:
+        assert process.stdout is not None
+        try:
+            while True:
+                chunk = process.stdout.read(8192)
+                if not chunk:
+                    break
+                output_tail.extend(chunk)
+                overflow = len(output_tail) - MAX_COMMAND_OUTPUT_BYTES
+                if overflow > 0:
+                    del output_tail[:overflow]
+        except (OSError, ValueError) as exc:
+            reader_errors.append(OSError(str(exc)))
+
+    reader = Thread(target=drain_output, name="polyguard-output-reader", daemon=True)
+    reader.start()
+    deadline = time.monotonic() + timeout
     try:
-        output, _ = process.communicate(timeout=timeout)
+        process.wait(timeout=timeout)
+        reader.join(timeout=max(0.0, deadline - time.monotonic()))
+        if reader.is_alive():
+            # The main process may have exited while a descendant still holds
+            # the inherited output pipe open. This remains a command timeout.
+            raise subprocess.TimeoutExpired(command, timeout)
     except subprocess.TimeoutExpired as exc:
         _terminate_process_tree(process)
-        output, _ = process.communicate()
-        raise subprocess.TimeoutExpired(
-            command,
-            timeout,
-            output=output if output is not None else exc.output,
-        ) from exc
+        try:
+            process.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait()
+        reader.join(timeout=10)
+        if reader.is_alive() and process.stdout is not None:
+            process.stdout.close()
+            reader.join(timeout=1)
+        output = output_tail.decode("utf-8", errors="replace")
+        raise subprocess.TimeoutExpired(command, timeout, output=output) from exc
+
+    if reader_errors:
+        raise OSError(f"Could not capture command output: {reader_errors[0]}")
+    output = output_tail.decode("utf-8", errors="replace")
     return subprocess.CompletedProcess(command, process.returncode, output)
 
 
@@ -1056,7 +1153,7 @@ def run_checks(
         return _failure_report("No supported language project was detected.", "project")
 
     results: list[CheckResult] = []
-    execution_cache: dict[tuple[Path, tuple[tuple[str, ...], ...]], CheckResult] = {}
+    execution_cache: dict[tuple[Path, str, tuple[tuple[str, ...], ...]], CheckResult] = {}
     all_files = _project_files(root)
     for unit in units:
         language = unit.language
@@ -1092,8 +1189,10 @@ def run_checks(
             ))
             continue
 
+        cache_language = "c-cpp-shared" if language in {"c", "cpp"} else language
         execution_key = (
             unit.root,
+            cache_language,
             tuple(tuple(command) for command in commands),
         )
         cached_result = execution_cache.get(execution_key)

@@ -40,7 +40,7 @@ polyguard verify --config ./ci/polyguard.toml
 polyguard --version
 \`\`\`
 
-Exit code is **0** for PASS and **1** for FAIL. Missing tests, missing toolchains, invalid configuration, a build/test failure, timeout, or missing positive test-execution evidence returns FAIL. On timeout, Polyguard terminates the command's process group/tree to avoid leaving test-runner descendants behind.
+Exit code is **0** for PASS and **1** for FAIL. Missing tests, missing toolchains, invalid configuration, a build/test failure, timeout, or missing positive test-execution evidence returns FAIL. On timeout, Polyguard terminates the command's process group/tree to avoid leaving test-runner descendants behind. Captured output is streamed and limited to the final 256 KiB per command.
 
 ## Built-in language support
 

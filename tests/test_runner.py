@@ -113,6 +113,29 @@ def test_go_json_evidence_rejects_non_object_event() -> None:
     assert _execution_evidence("go", "[]")[0] is None
 
 
+def test_go_json_evidence_accepts_skip_events_alongside_passes() -> None:
+    output = "\n".join([
+        json.dumps({"Action": "run", "Test": "TestIncluded"}),
+        json.dumps({"Action": "pass", "Test": "TestIncluded", "Elapsed": 0.001}),
+        json.dumps({"Action": "run", "Test": "TestOptional"}),
+        json.dumps({"Action": "skip", "Test": "TestOptional"}),
+        json.dumps({"Action": "pass", "Package": "example"}),
+    ])
+    assert _execution_evidence("go", output)[0] == 1
+
+
+def test_go_json_evidence_rejects_invalid_event_fields() -> None:
+    invalid = [
+        {"Action": "unknown", "Test": "TestAdd"},
+        {"Action": "pass", "Test": 42},
+        {"Action": "pass", "Package": []},
+        {"Action": "pass", "Test": "TestAdd", "Elapsed": -1},
+        {"Action": "pass", "Test": "TestAdd", "Elapsed": True},
+    ]
+    for event in invalid:
+        assert _execution_evidence("go", json.dumps(event))[0] is None
+
+
 def test_go_json_evidence_counts_pass_events() -> None:
     output = "\n".join([
         json.dumps({"Action": "run", "Test": "TestAdd"}),
@@ -261,6 +284,59 @@ def test_no_supported_language_fails_closed(tmp_path: Path) -> None:
 def test_timeout_validation_fails_closed(tmp_path: Path) -> None:
     report = run_checks(tmp_path, timeout=0)
     assert report["status"] == "FAIL"
+
+
+def test_command_output_capture_is_bounded_and_keeps_the_tail(tmp_path: Path) -> None:
+    import polyguard.runner as runner
+
+    payload_bytes = runner.MAX_COMMAND_OUTPUT_BYTES * 5
+    script = (
+        "import sys; "
+        f"sys.stdout.write('x' * {payload_bytes}); "
+        "sys.stdout.write('\\nFINAL-OUTPUT-MARKER\\n')"
+    )
+    completed = runner._run_command([sys.executable, "-c", script], cwd=tmp_path, timeout=10)
+    encoded = completed.stdout.encode("utf-8")
+
+    assert completed.returncode == 0
+    assert len(encoded) <= runner.MAX_COMMAND_OUTPUT_BYTES
+    assert completed.stdout.endswith("\nFINAL-OUTPUT-MARKER\n")
+    assert "FINAL-OUTPUT-MARKER" in completed.stdout
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="Linux /proc process-state check")
+def test_timeout_kills_descendant_after_parent_exits(tmp_path: Path) -> None:
+    import subprocess
+    import time
+    import polyguard.runner as runner
+
+    pid_file = tmp_path / "orphaned-child.pid"
+    child_script = "import time; time.sleep(60)"
+    parent_script = (
+        "import subprocess, sys; "
+        "child = subprocess.Popen([sys.executable, '-c', sys.argv[2]]); "
+        "open(sys.argv[1], 'w', encoding='utf-8').write(str(child.pid))"
+    )
+    with pytest.raises(subprocess.TimeoutExpired):
+        runner._run_command(
+            [sys.executable, "-c", parent_script, str(pid_file), child_script],
+            cwd=tmp_path,
+            timeout=1,
+        )
+
+    assert pid_file.exists(), "The parent process did not launch its descendant."
+    child_pid = int(pid_file.read_text(encoding="utf-8"))
+    deadline = time.monotonic() + 3
+    while time.monotonic() < deadline:
+        stat_file = Path(f"/proc/{child_pid}/stat")
+        if not stat_file.exists():
+            break
+        fields = stat_file.read_text(encoding="utf-8").split()
+        if len(fields) > 2 and fields[2] == "Z":
+            break
+        time.sleep(0.05)
+    else:
+        pytest.fail(f"Timed-out command left descendant {child_pid} running.")
 
 
 def test_windows_timeout_uses_taskkill_process_tree(monkeypatch) -> None:
@@ -423,6 +499,34 @@ def test_monorepo_runs_each_language_from_its_own_project_root(tmp_path: Path, m
     }
 
 
+def test_execution_cache_is_scoped_by_language(tmp_path: Path, monkeypatch) -> None:
+    from types import SimpleNamespace
+    import polyguard.runner as runner
+
+    (tmp_path / "pyproject.toml").write_text("[project]\nname='fixture'\n", encoding="utf-8")
+    (tmp_path / "go.mod").write_text("module example.test/cache\ngo 1.22\n", encoding="utf-8")
+    (tmp_path / "test_app.py").write_text("def test_ok(): assert True\n", encoding="utf-8")
+    (tmp_path / "main_test.go").write_text(
+        "package main\nfunc TestCache(t *testing.T) {}\n", encoding="utf-8"
+    )
+    monkeypatch.setattr(
+        runner, "_default_plans",
+        lambda root, files: {"go": [["fake-test"]], "python": [["fake-test"]]},
+    )
+    monkeypatch.setattr(
+        runner, "_run_command",
+        lambda command, **kwargs: SimpleNamespace(
+            returncode=0, stdout=json.dumps({"Action": "pass", "Test": "TestCache"})
+        ),
+    )
+    monkeypatch.setattr(runner.shutil, "which", lambda executable: "/fake/test")
+
+    report = run_checks(tmp_path)
+    results = {item["language"]: item for item in report["results"]}
+    assert results["go"]["status"] == "PASS"
+    assert results["python"]["status"] == "FAIL"
+
+
 def test_monorepo_keeps_same_language_packages_separate(tmp_path: Path, monkeypatch) -> None:
     from types import SimpleNamespace
     import polyguard.runner as runner
@@ -559,7 +663,9 @@ def test_trx_counts_pass_fail_and_not_executed(tmp_path: Path) -> None:
     report.write_text(
         '<TestRun><ResultSummary><Counters total="3" executed="2" passed="1" '
         'failed="1" error="0" aborted="0" timeout="0" notExecuted="1" '
-        'inconclusive="0" notRunnable="0"/></ResultSummary></TestRun>',
+        'inconclusive="0" notRunnable="0"/></ResultSummary>'
+        '<Results><UnitTestResult outcome="Passed"/><UnitTestResult outcome="Failed"/>'
+        '<UnitTestResult outcome="NotExecuted"/></Results></TestRun>',
         encoding="utf-8",
     )
     assert _parse_trx(report) == (3, 1, 1)
@@ -607,7 +713,8 @@ def test_csharp_all_skipped_trx_report_fails_closed(tmp_path: Path, monkeypatch)
         result_dir.mkdir(exist_ok=True)
         (result_dir / "polyguard.trx").write_text(
             '<TestRun><ResultSummary><Counters total="1" executed="0" passed="0" '
-            'failed="0" error="0" notExecuted="1"/></ResultSummary></TestRun>',
+            'failed="0" error="0" notExecuted="1"/></ResultSummary>'
+            '<Results><UnitTestResult outcome="NotExecuted"/></Results></TestRun>',
             encoding="utf-8",
         )
         return SimpleNamespace(returncode=0, stdout="Build succeeded.")
@@ -912,7 +1019,8 @@ def test_dotnet_solution_runs_child_projects_once(tmp_path: Path, monkeypatch) -
         report_dir.mkdir(exist_ok=True)
         (report_dir / "polyguard.trx").write_text(
             '<TestRun><ResultSummary><Counters total="1" executed="1" passed="1" '
-            'failed="0" error="0" notExecuted="0"/></ResultSummary></TestRun>',
+            'failed="0" error="0" notExecuted="0"/></ResultSummary>'
+            '<Results><UnitTestResult outcome="Passed"/></Results></TestRun>',
             encoding="utf-8",
         )
         return SimpleNamespace(returncode=0, stdout="")
@@ -966,6 +1074,70 @@ def test_junit_aggregate_counters_without_testcases_are_not_evidence(tmp_path: P
     )
     with pytest.raises(ValueError, match="counter does not match testcase records"):
         _parse_junit_xml(report)
+
+
+def test_native_report_parsers_reject_wrong_roots_and_invalid_trx_counters(tmp_path: Path) -> None:
+    from polyguard.runner import _parse_junit_xml, _parse_trx
+
+    junit = tmp_path / "wrong.xml"
+    junit.write_text("<html><body>1 passed</body></html>", encoding="utf-8")
+    with pytest.raises(ValueError, match="JUnit root"):
+        _parse_junit_xml(junit)
+
+    trx = tmp_path / "bad.trx"
+    trx.write_text(
+        '<TestRun><ResultSummary><Counters total="-1" passed="1" failed="0"/>'
+        '</ResultSummary></TestRun>',
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="required counters|negative"):
+        _parse_trx(trx)
+
+    trx.write_text(
+        '<TestRun><ResultSummary><Counters total="1" failed="0"/>'
+        '</ResultSummary></TestRun>',
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="required counters"):
+        _parse_trx(trx)
+
+
+def test_native_report_parsers_reject_result_record_mismatches(tmp_path: Path) -> None:
+    from polyguard.runner import _parse_junit_xml, _parse_trx
+
+    junit = tmp_path / "mismatch.xml"
+    junit.write_text(
+        '<testsuite tests="1" failures="1" errors="0" skipped="0">'
+        '<testcase name="ok"/></testsuite>',
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="failure/error counters"):
+        _parse_junit_xml(junit)
+
+    trx = tmp_path / "mismatch.trx"
+    trx.write_text(
+        '<TestRun><ResultSummary><Counters total="1" passed="1" failed="0"/>'
+        '</ResultSummary><Results><UnitTestResult outcome="Failed"/></Results></TestRun>',
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="records do not match"):
+        _parse_trx(trx)
+
+
+def test_project_file_discovery_excludes_symlinks_outside_root(tmp_path: Path) -> None:
+    from pathlib import Path
+    from polyguard.runner import _project_files
+
+    root = tmp_path / "project"
+    root.mkdir()
+    external = tmp_path / "outside_test.py"
+    external.write_text("def test_outside(): pass\n", encoding="utf-8")
+    link = root / "test_external.py"
+    try:
+        link.symlink_to(external)
+    except OSError:
+        pytest.skip("Symlink creation is not available.")
+    assert link not in _project_files(root)
 
 
 def test_files_for_unit_does_not_exclude_nested_different_language_project(tmp_path: Path) -> None:
@@ -1118,7 +1290,7 @@ def test_nested_native_report_projects_pass_from_their_own_root(
             (result_dir / "polyguard.trx").write_text(
                 '<TestRun><ResultSummary><Counters total="1" executed="1" passed="1" '
                 'failed="0" error="0" notExecuted="0" inconclusive="0" notRunnable="0"/>'
-                '</ResultSummary></TestRun>', encoding="utf-8"
+                '</ResultSummary><Results><UnitTestResult outcome="Passed"/></Results></TestRun>', encoding="utf-8"
             )
         elif language == "php":
             (result_dir / "phpunit.xml").write_text(
