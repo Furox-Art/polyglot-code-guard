@@ -730,9 +730,37 @@ def _matching_config_tests(
     return False
 
 
+def _node_test_file_paths(root: Path, files: Iterable[Path]) -> set[str]:
+    """Snapshot files matched by Node's documented default test discovery globs."""
+    matched: set[str] = set()
+    supported_suffixes = {".js", ".cjs", ".mjs", ".ts", ".cts", ".mts"}
+    for path in files:
+        try:
+            relative = path.relative_to(root).as_posix()
+        except ValueError:
+            continue
+        parts = relative.replace("\\", "/").split("/")
+        filename = parts[-1]
+        suffix = Path(filename).suffix
+        if suffix not in supported_suffixes:
+            continue
+        if "test" in parts[:-1]:
+            matched.add(relative)
+            continue
+        stem = filename[:-len(suffix)]
+        if (
+            stem == "test"
+            or stem.startswith("test-")
+            or stem.endswith((".test", "-test", "_test"))
+        ):
+            matched.add(relative)
+    return matched
+
+
 def _javascript_junit_evidence(
     output: str,
     project_root: Path | None,
+    node_test_files: set[str],
 ) -> tuple[int | None, str]:
     """Count actual Node test cases, not the file-level pass emitted for empty suites."""
     xml_start = output.index("<?xml")
@@ -750,26 +778,21 @@ def _javascript_junit_evidence(
     passed = 0
     for case in cases:
         name = case.attrib.get("name", "")
-        if not name:
-            continue
-        # Node's JUnit reporter emits a passing testcase for a test file even
-        # when that file defines/runs no subtests. Classify paths lexically:
-        # the file may delete itself before the report is parsed.
-        candidate = Path(name)
-        if project_root is not None and not candidate.is_absolute():
-            candidate = project_root / candidate
-        is_javascript_file = candidate.suffix.lower() in {
-            ".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx",
-        }
-        in_test_tree = any(
-            part.lower() in {"test", "tests", "spec", "specs"}
-            for part in candidate.parts[:-1]
-        )
-        is_test_file = is_javascript_file and (
-            in_test_tree
-            or re.search(r"\.(test|spec)\.", candidate.name, re.I) is not None
-        )
-        if is_test_file:
+        if not name or not name.strip():
+            return None, "Node JUnit report contains a testcase with a missing or empty name."
+        # Node emits file-level testcase records for empty test files. Use
+        # the file list captured before execution, because a test may delete
+        # itself before its JUnit report is parsed.
+        normalized_name = name.replace("\\", "/").strip()
+        candidate = Path(normalized_name)
+        if project_root is not None and candidate.is_absolute():
+            try:
+                normalized_name = candidate.relative_to(project_root.resolve()).as_posix()
+            except ValueError:
+                normalized_name = candidate.as_posix()
+        while normalized_name.startswith("./"):
+            normalized_name = normalized_name[2:]
+        if normalized_name in node_test_files:
             continue
 
         child_names = {_xml_local_name(child.tag) for child in list(case)}
@@ -786,10 +809,11 @@ def _execution_evidence(
     language: str,
     output: str,
     project_root: Path | None = None,
+    node_test_files: set[str] | None = None,
 ) -> tuple[int | None, str]:
     """Parse a positive successful-test count from a built-in runner summary."""
     if language == "javascript" and "<?xml" in output:
-        return _javascript_junit_evidence(output, project_root)
+        return _javascript_junit_evidence(output, project_root, node_test_files or set())
     if language == "go":
         passed = 0
         for line in output.splitlines():
@@ -1211,6 +1235,11 @@ def run_checks(
     for unit in units:
         language = unit.language
         unit_files = _files_for_unit(root, unit, units, all_files)
+        node_test_files = (
+            _node_test_file_paths(unit.root, unit_files)
+            if language == "javascript"
+            else set()
+        )
         default_commands = _default_plans(unit.root, unit_files).get(language, [])
         language_config = configured.get(language)
         commands = language_config.commands if language_config else default_commands
@@ -1347,6 +1376,7 @@ def run_checks(
                     language,
                     combined_output,
                     unit.root,
+                    node_test_files,
                 )
                 if tests_passed is None:
                     passed = False

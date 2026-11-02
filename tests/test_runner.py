@@ -7,6 +7,7 @@ import pytest
 from polyguard.runner import (
     _execution_evidence,
     _has_test,
+    _node_test_file_paths,
     discover,
     render_report,
     run_checks,
@@ -179,11 +180,46 @@ def test_ctest_evidence_requires_real_passed_test_records() -> None:
     assert _execution_evidence("cpp", mixed)[0] == 1
 
 
+def test_node_test_file_snapshot_covers_default_discovery_names(tmp_path: Path) -> None:
+    file_records = [
+        "test.js", "test.cjs", "test.mjs",
+        "sample-test.js", "sample-test.cjs", "sample-test.mjs",
+        "sample_test.js", "test-example.js", "sample.test.js",
+        "sample.test.cjs", "sample.test.mjs",
+        "test/helper.js", "nested/test/helper.cjs",
+        "sample.test.ts", "sample-test.cts", "sample_test.mts",
+        "test/helper.ts", "test/helper.cts", "test/helper.mts",
+    ]
+    files = []
+    for relative in file_records:
+        path = tmp_path / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("// fixture\\n", encoding="utf-8")
+        files.append(path)
+
+    assert _node_test_file_paths(tmp_path, files) == set(file_records)
+    assert _node_test_file_paths(tmp_path, [tmp_path.parent / "outside.test.js"]) == set()
+
+    not_default_files = [
+        "tests/ordinary.js", "spec/example.spec.js", "production/app.js",
+        "helper.jsx", "view.tsx", "src/test-helper.jsx",
+        "TEST.js", "Foo.TEST.js", "Test/helper.js",
+    ]
+    paths = []
+    for relative in not_default_files:
+        path = tmp_path / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("// not default-discovered\\n", encoding="utf-8")
+        paths.append(path)
+    assert _node_test_file_paths(tmp_path, paths) == set()
+
+
 def test_javascript_node_junit_requires_actual_subtest_records(tmp_path: Path) -> None:
     test_dir = tmp_path / "tests"
     test_dir.mkdir()
     empty_file = test_dir / "empty.test.js"
     empty_file.write_text("process.exit(0);\n", encoding="utf-8")
+    node_test_files = _node_test_file_paths(tmp_path, [empty_file])
     # Node retains the file-level JUnit record even when a test deletes itself.
     empty_file.unlink()
 
@@ -192,14 +228,34 @@ def test_javascript_node_junit_requires_actual_subtest_records(tmp_path: Path) -
         '<testsuites><testcase name="tests/empty.test.js" time="0.01" classname="test"/>'
         '</testsuites>'
     )
-    assert _execution_evidence("javascript", empty_report, tmp_path)[0] is None
+    assert _execution_evidence("javascript", empty_report, tmp_path, node_test_files)[0] is None
+
+    absolute_file_report = (
+        '<?xml version="1.0" encoding="utf-8"?>'
+        f'<testsuites><testcase name="{empty_file.as_posix()}"/></testsuites>'
+    )
+    assert _execution_evidence("javascript", absolute_file_report, tmp_path, node_test_files)[0] is None
+
+    dot_relative_file_report = (
+        '<?xml version="1.0" encoding="utf-8"?>'
+        '<testsuites><testcase name="./tests/empty.test.js"/></testsuites>'
+    )
+    assert _execution_evidence("javascript", dot_relative_file_report, tmp_path, node_test_files)[0] is None
+
+    outside_root_report = (
+        '<?xml version="1.0" encoding="utf-8"?>'
+        f'<testsuites><testcase name="{(tmp_path.parent / "outside.test.js").as_posix()}"/></testsuites>'
+    )
+    assert _execution_evidence("javascript", outside_root_report, tmp_path, node_test_files)[0] == 1
 
     real_report = (
         '<?xml version="1.0" encoding="utf-8"?>'
-        '<testsuites><testcase name="addition works" time="0.01" classname="test"/>'
+        '<testsuites><testcase name="tests/real.test.js" time="0.01" classname="test"/>'
         '</testsuites>'
     )
-    assert _execution_evidence("javascript", real_report, tmp_path)[0] == 1
+    # A real test can legitimately be named like a test-file path. It is
+    # retained unless that exact path was discovered as a physical file.
+    assert _execution_evidence("javascript", real_report, tmp_path, node_test_files)[0] == 1
 
 
 def test_javascript_node_junit_rejects_invalid_and_skipped_reports(tmp_path: Path) -> None:
@@ -233,13 +289,25 @@ def test_javascript_node_junit_rejects_invalid_and_skipped_reports(tmp_path: Pat
         '<?xml version="1.0" encoding="utf-8"?>'
         '<testsuites><testcase name="tests/deleted.test.js"/></testsuites>'
     )
-    assert _execution_evidence("javascript", missing_file_record, tmp_path)[0] is None
+    assert _execution_evidence("javascript", missing_file_record, tmp_path, {"tests/deleted.test.js"})[0] is None
 
     missing_spec_record = (
         '<?xml version="1.0" encoding="utf-8"?>'
-        '<testsuites><testcase name="outside.spec.ts"/></testsuites>'
+        '<testsuites><testcase name="outside-test.ts"/></testsuites>'
     )
-    assert _execution_evidence("javascript", missing_spec_record, tmp_path)[0] is None
+    assert _execution_evidence("javascript", missing_spec_record, tmp_path, {"outside-test.ts"})[0] is None
+
+    mixed_missing_name = (
+        '<?xml version="1.0" encoding="utf-8"?>'
+        '<testsuites><testcase name="real test"/><testcase time="0.01"/></testsuites>'
+    )
+    assert _execution_evidence("javascript", mixed_missing_name, tmp_path)[0] is None
+
+    whitespace_name = (
+        '<?xml version="1.0" encoding="utf-8"?>'
+        '<testsuites><testcase name="   "/></testsuites>'
+    )
+    assert _execution_evidence("javascript", whitespace_name, tmp_path)[0] is None
 
 
 def test_javascript_tap_evidence_requires_passing_tests() -> None:

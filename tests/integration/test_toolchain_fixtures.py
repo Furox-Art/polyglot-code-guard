@@ -258,6 +258,9 @@ def test_node_file_without_executed_subtests_fails_closed(tmp_path: Path) -> Non
     """Node's file-level pass is not evidence that a test case ran."""
     _require_toolchains(["javascript"])
     _write(tmp_path, "package.json", '{"name":"polyguard-node-empty-fixture","version":"1.0.0"}\n')
+    # Exercise Node's root-level and test-directory default discovery patterns.
+    for relative in ("test.js", "sample-test.js", "sample_test.js", "test-example.js", "test/helper.js"):
+        _write(tmp_path, relative, "process.exit(0);\n")
     _write(
         tmp_path,
         "tests/empty.test.js",

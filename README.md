@@ -49,7 +49,7 @@ Exit code is **0** for PASS and **1** for FAIL. Missing tests, missing toolchain
 | Python | \`compileall\`, then \`pytest -q\` | Pytest passed-test summary |
 | Rust | \`cargo test --all-targets\` | Cargo test-result summary |
 | Go | \`go test -json ./...\` | Passing test events in JSON stream |
-| JavaScript / TypeScript | Direct Vitest/Jest/Mocha/TAP CLI when declared, otherwise `node --test --test-reporter=junit`; TypeScript also runs `tsc --noEmit` when configured | Node fallback: validated JUnit test-case records; declared runners: recognized runner summary |
+| JavaScript / TypeScript | Direct Vitest/Jest/Mocha/TAP CLI when declared, otherwise `node --test --test-reporter=junit`; TypeScript also runs `tsc --noEmit` when configured | Node fallback: JUnit testcase records cross-checked against a pre-execution snapshot of Node-discovered test files; missing-name records and file-path collisions fail closed; declared runners: recognized runner summary |
 | Java | Maven `clean test` or Gradle `clean test` | Parsed Surefire/Gradle JUnit XML; at least one pass, zero failures |
 | C# | dotnet test with a Polyguard TRX prefix | Parsed TRX counters; at least one pass, zero failures |
 | PHP | PHPUnit with --log-junit | Parsed JUnit XML; at least one pass, zero failures |
