@@ -1,0 +1,14 @@
+# Copy this file to .polyguard.toml and customize it.
+# Commands are argument arrays, not shell strings.
+
+[project]
+# Languages listed here are mandatory, even when auto-detection does not find them.
+languages = ["python"]
+
+[checks.python]
+commands = [
+  ["python3", "-m", "compileall", "-q", "src"],
+  ["python3", "-m", "pytest", "-q"],
+]
+# At least one matching file must exist before the commands are run.
+test_patterns = ["tests/test_*.py", "tests/**/*.py"]

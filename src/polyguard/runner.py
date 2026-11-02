@@ -1,4 +1,4 @@
-"""Language discovery and fail-closed test execution."""
+"""Language discovery, configurable test plans, and fail-closed execution."""
 
 from __future__ import annotations
 
@@ -12,11 +12,25 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Iterable
 
+try:
+    import tomllib
+except ModuleNotFoundError:  # Python 3.10
+    import tomli as tomllib
+
 
 IGNORED_DIRS = {
     ".git", ".hg", ".svn", ".venv", "venv", "env", "node_modules",
     "__pycache__", ".mypy_cache", ".pytest_cache", ".tox", "dist",
     "build", ".polyguard-build", "target", ".next", ".nuxt",
+}
+SUPPORTED_LANGUAGES = {
+    "python", "rust", "go", "javascript", "java", "csharp",
+    "php", "ruby", "swift", "cpp",
+}
+LANGUAGE_ALIASES = {
+    "py": "python", "js": "javascript", "ts": "javascript",
+    "c": "cpp", "c++": "cpp", "cc": "cpp", "cxx": "cpp",
+    "cs": "csharp",
 }
 
 
@@ -31,6 +45,17 @@ class CheckResult:
     output: str = ""
 
 
+@dataclass
+class LanguageConfig:
+    commands: list[list[str]]
+    test_patterns: list[str]
+
+
+def normalize_language(language: str) -> str:
+    key = language.strip().lower()
+    return LANGUAGE_ALIASES.get(key, key)
+
+
 def _project_files(root: Path) -> list[Path]:
     found: list[Path] = []
     for path in root.rglob("*"):
@@ -41,59 +66,12 @@ def _project_files(root: Path) -> list[Path]:
     return found
 
 
-def _in_test_tree(path: Path) -> bool:
-    return any(part.lower() in {"test", "tests", "spec", "specs"} for part in path.parts)
-
-
-def _has_test(files: Iterable[Path], language: str) -> bool:
-    """Require a recognizable test declaration, not merely a file named like a test."""
-    all_files = list(files)
-    for path in all_files:
-        name = path.name.lower()
-        suffix = path.suffix.lower()
-        content = _safe_read(path)
-
-        if language == "python" and suffix == ".py":
-            is_test_file = _in_test_tree(path) or name.startswith("test_") or name.endswith("_test.py")
-            if is_test_file and re.search(r"\b(?:def\s+test_\w+\s*\(|class\s+Test\w*)", content):
-                return True
-        elif language == "rust" and suffix == ".rs":
-            if re.search(r"#\s*\[\s*(?:test|tokio::test|async_std::test)\s*\]", content):
-                return True
-        elif language == "javascript" and suffix in {".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx"}:
-            is_test_file = _in_test_tree(path) or re.search(r"\.(test|spec)\.", name)
-            if is_test_file and re.search(r"\b(?:test|it|specify)\s*(?:\.\w+)?\s*\(", content):
-                return True
-        elif language == "go" and name.endswith("_test.go"):
-            if re.search(r"\bfunc\s+Test[A-Z]\w*\s*\(", content):
-                return True
-        elif language == "java" and suffix == ".java":
-            is_test_file = _in_test_tree(path) or name.endswith(("test.java", "tests.java"))
-            if is_test_file and re.search(r"@(?:Test|ParameterizedTest|RepeatedTest|TestFactory|TestTemplate)\b", content):
-                return True
-        elif language == "csharp" and suffix == ".cs":
-            if re.search(r"\[(?:Fact|Theory|Test|TestCase|TestMethod)\b", content):
-                return True
-        elif language == "php" and suffix == ".php":
-            is_test_file = _in_test_tree(path) or name.startswith("test")
-            if is_test_file and re.search(r"(?:function\s+test\w*\s*\(|#\[Test\])", content, re.I):
-                return True
-        elif language == "ruby" and suffix == ".rb":
-            is_test_file = _in_test_tree(path) or name.startswith("test_") or name.endswith("_spec.rb")
-            if is_test_file and re.search(r"\b(?:it|specify|example)\s+['\"].+?\bdo\b|\bdef\s+test_\w+", content, re.S):
-                return True
-        elif language == "swift" and suffix == ".swift":
-            if _in_test_tree(path) and re.search(r"(?:\bfunc\s+test\w*\s*\(|@Test\b)", content):
-                return True
-        elif language == "cpp" and suffix in {".c", ".cc", ".cpp", ".cxx", ".h", ".hpp"}:
-            if (_in_test_tree(path) or "test" in name) and re.search(r"\b(?:TEST|TEST_F|TEST_P|TEST_CASE)\s*\(", content):
-                cmake_files = [p for p in all_files if p.name.lower() == "cmakelists.txt"]
-                cmake_text = "\n".join(_safe_read(p) for p in cmake_files)
-                enabled = re.search(r"\b(?:enable_testing)\s*\(|\binclude\s*\(\s*CTest\b", cmake_text, re.I)
-                registered = re.search(r"\b(?:add_test|gtest_discover_tests|catch_discover_tests)\s*\(", cmake_text)
-                if enabled and registered:
-                    return True
-    return False
+def _in_test_tree(root: Path, path: Path) -> bool:
+    try:
+        relative = path.relative_to(root)
+    except ValueError:
+        relative = path
+    return any(part.lower() in {"test", "tests", "spec", "specs"} for part in relative.parts[:-1])
 
 
 def _safe_read(path: Path) -> str:
@@ -103,24 +81,86 @@ def _safe_read(path: Path) -> str:
         return ""
 
 
-def discover(root: Path) -> list[tuple[str, list[list[str]]]]:
-    """Return supported language plans. A detected language without tests is still a failure."""
+def _has_test(files: Iterable[Path], language: str, root: Path | None = None) -> bool:
+    """Require recognizable test declarations, not only test-looking filenames."""
+    all_files = list(files)
+    base = root.resolve() if root else None
+    for path in all_files:
+        name = path.name.lower()
+        suffix = path.suffix.lower()
+        content = _safe_read(path)
+        in_test_tree = _in_test_tree(base, path) if base else any(
+            part.lower() in {"test", "tests", "spec", "specs"} for part in path.parts[:-1]
+        )
+
+        if language == "python" and suffix == ".py":
+            is_test_file = in_test_tree or name.startswith("test_") or name.endswith("_test.py")
+            if is_test_file and re.search(r"\b(?:def\s+test_\w+\s*\(|class\s+Test\w*)", content):
+                return True
+        elif language == "rust" and suffix == ".rs":
+            if re.search(r"#\s*\[\s*(?:test|tokio::test|async_std::test)\s*\]", content):
+                return True
+        elif language == "javascript" and suffix in {".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx"}:
+            is_test_file = in_test_tree or re.search(r"\.(test|spec)\.", name)
+            if is_test_file and re.search(r"\b(?:test|it|specify)\s*(?:\.\w+)?\s*\(", content):
+                return True
+        elif language == "go" and name.endswith("_test.go"):
+            if re.search(r"\bfunc\s+Test[A-Z]\w*\s*\(", content):
+                return True
+        elif language == "java" and suffix == ".java":
+            is_test_file = in_test_tree or name.endswith(("test.java", "tests.java"))
+            if is_test_file and re.search(
+                r"@(?:Test|ParameterizedTest|RepeatedTest|TestFactory|TestTemplate)\b", content
+            ):
+                return True
+        elif language == "csharp" and suffix == ".cs":
+            if re.search(r"\[(?:Fact|Theory|Test|TestCase|TestMethod)\b", content):
+                return True
+        elif language == "php" and suffix == ".php":
+            is_test_file = in_test_tree or name.startswith("test")
+            if is_test_file and re.search(r"(?:function\s+test\w*\s*\(|#\[Test\])", content, re.I):
+                return True
+        elif language == "ruby" and suffix == ".rb":
+            is_test_file = in_test_tree or name.startswith("test_") or name.endswith("_spec.rb")
+            if is_test_file and re.search(
+                r"\b(?:it|specify|example)\s+['\"].+?\bdo\b|\bdef\s+test_\w+", content, re.S
+            ):
+                return True
+        elif language == "swift" and suffix == ".swift":
+            if in_test_tree and re.search(r"(?:\bfunc\s+test\w*\s*\(|@Test\b)", content):
+                return True
+        elif language == "cpp" and suffix in {".c", ".cc", ".cpp", ".cxx", ".h", ".hpp"}:
+            if (in_test_tree or "test" in name) and re.search(
+                r"\b(?:TEST|TEST_F|TEST_P|TEST_CASE)\s*\(", content
+            ):
+                cmake_files = [p for p in all_files if p.name.lower() == "cmakelists.txt"]
+                cmake_text = "\n".join(_safe_read(p) for p in cmake_files)
+                enabled = re.search(
+                    r"\b(?:enable_testing)\s*\(|\binclude\s*\(\s*CTest\b", cmake_text, re.I
+                )
+                registered = re.search(
+                    r"\b(?:add_test|gtest_discover_tests|catch_discover_tests)\s*\(", cmake_text
+                )
+                if enabled and registered:
+                    return True
+    return False
+
+
+def _default_plans(root: Path) -> dict[str, list[list[str]]]:
     files = _project_files(root)
     names = {p.name for p in files}
-    plans: list[tuple[str, list[list[str]]]] = []
+    plans: dict[str, list[list[str]]] = {}
 
-    py_files = [p for p in files if p.suffix == ".py"]
-    if py_files:
-        plans.append(("python", [
+    if any(p.suffix.lower() == ".py" for p in files):
+        plans["python"] = [
             [sys.executable, "-m", "compileall", "-q", "."],
             [sys.executable, "-m", "pytest", "-q"],
-        ]))
+        ]
 
     if "Cargo.toml" in names or any(p.suffix == ".rs" for p in files):
-        plans.append(("rust", [["cargo", "test", "--all-targets"]]))
-
+        plans["rust"] = [["cargo", "test", "--all-targets"]]
     if "go.mod" in names:
-        plans.append(("go", [["go", "test", "./..."]]))
+        plans["go"] = [["go", "test", "./..."]]
 
     js_project = "package.json" in names and any(
         p.suffix.lower() in {".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx"} for p in files
@@ -129,70 +169,172 @@ def discover(root: Path) -> list[tuple[str, list[list[str]]]]:
         js_commands = [["npm", "test"]]
         if "tsconfig.json" in names:
             js_commands.append(["npx", "--no-install", "tsc", "--noEmit"])
-        plans.append(("javascript", js_commands))
+        plans["javascript"] = js_commands
 
     java_build = names.intersection({"pom.xml", "build.gradle", "build.gradle.kts", "mvnw", "gradlew"})
     if java_build:
         if "pom.xml" in names:
-            cmd = ["./mvnw", "test"] if "mvnw" in names else ["mvn", "test"]
+            command = ["./mvnw", "test"] if "mvnw" in names else ["mvn", "test"]
         else:
-            cmd = ["./gradlew", "test"] if "gradlew" in names else ["gradle", "test"]
-        plans.append(("java", [cmd]))
+            command = ["./gradlew", "test"] if "gradlew" in names else ["gradle", "test"]
+        plans["java"] = [command]
 
-    cs_projects = [p for p in files if p.suffix.lower() in {".csproj", ".sln"}]
-    if cs_projects:
-        plans.append(("csharp", [["dotnet", "test", "--no-restore"]]))
+    if any(p.suffix.lower() in {".csproj", ".sln"} for p in files):
+        plans["csharp"] = [["dotnet", "test"]]
 
     if "composer.json" in names:
         phpunit = root / "vendor" / "bin" / "phpunit"
-        plans.append(("php", [[str(phpunit)] if phpunit.exists() else ["phpunit"]]))
+        plans["php"] = [[str(phpunit)] if phpunit.exists() else ["phpunit"]]
 
     if "Gemfile" in names or any(p.suffix == ".gemspec" for p in files):
-        if any(p.parts[-2:-1] == ("spec",) for p in files):
-            plans.append(("ruby", [["bundle", "exec", "rspec"]]))
+        if any(p.name.lower().endswith("_spec.rb") for p in files):
+            plans["ruby"] = [["bundle", "exec", "rspec"]]
         else:
-            plans.append(("ruby", [["bundle", "exec", "rake", "test"]]))
+            plans["ruby"] = [["bundle", "exec", "rake", "test"]]
 
     if "Package.swift" in names:
-        plans.append(("swift", [["swift", "test"]]))
+        plans["swift"] = [["swift", "test"]]
 
     if "CMakeLists.txt" in names:
-        cmake_text = _safe_read(root / "CMakeLists.txt")
+        cmake = next((p for p in files if p.name.lower() == "cmakelists.txt" and p.parent == root), None)
+        cmake_text = _safe_read(cmake) if cmake else ""
         if re.search(r"enable_testing\s*\(|include\s*\(\s*CTest", cmake_text, re.I):
-            plans.append(("cpp", [
+            plans["cpp"] = [
                 ["cmake", "-S", ".", "-B", ".polyguard-build", "-DBUILD_TESTING=ON"],
                 ["cmake", "--build", ".polyguard-build", "--parallel"],
                 ["ctest", "--test-dir", ".polyguard-build", "--output-on-failure"],
-            ]))
+            ]
         else:
-            plans.append(("cpp", [["cmake", "-S", ".", "-B", ".polyguard-build"]]))
-
+            plans["cpp"] = [["cmake", "-S", ".", "-B", ".polyguard-build"]]
     return plans
 
 
-def run_checks(root: Path, timeout: int = 120) -> dict:
-    root = root.resolve()
-    if not root.is_dir():
-        return {
-            "status": "FAIL",
-            "results": [asdict(CheckResult("project", "FAIL", [], 2, 0.0, "Project directory does not exist."))],
-        }
+def _load_config(root: Path, config_path: str | Path | None) -> tuple[set[str], dict[str, LanguageConfig]]:
+    path = Path(config_path).expanduser() if config_path else root / ".polyguard.toml"
+    if not path.is_absolute():
+        path = path.resolve()
+    if not path.exists():
+        if config_path is not None:
+            raise ValueError(f"Configuration file does not exist: {path}")
+        return set(), {}
+    try:
+        data = tomllib.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, ValueError) as exc:
+        raise ValueError(f"Could not read TOML configuration {path}: {exc}") from exc
 
-    plans = discover(root)
+    if not isinstance(data, dict) or set(data) - {"project", "checks"}:
+        raise ValueError("Configuration may contain only [project] and [checks.<language>] sections.")
+
+    project = data.get("project", {})
+    checks = data.get("checks", {})
+    if not isinstance(project, dict) or set(project) - {"languages"}:
+        raise ValueError("[project] supports only the 'languages' key.")
+    if not isinstance(checks, dict):
+        raise ValueError("[checks] must contain language tables.")
+
+    languages = project.get("languages", [])
+    if not isinstance(languages, list) or not all(isinstance(x, str) for x in languages):
+        raise ValueError("[project].languages must be an array of language names.")
+
+    required: set[str] = set()
+    for item in languages:
+        language = normalize_language(item)
+        if language not in SUPPORTED_LANGUAGES:
+            raise ValueError(f"Unsupported language in [project].languages: {item}")
+        required.add(language)
+
+    configured: dict[str, LanguageConfig] = {}
+    for raw_language, section in checks.items():
+        language = normalize_language(raw_language)
+        if language not in SUPPORTED_LANGUAGES:
+            raise ValueError(f"Unsupported language in [checks]: {raw_language}")
+        if not isinstance(section, dict) or set(section) - {"commands", "test_patterns"}:
+            raise ValueError(f"[checks.{raw_language}] supports only 'commands' and 'test_patterns'.")
+        commands = section.get("commands")
+        patterns = section.get("test_patterns")
+        if not isinstance(commands, list) or not commands:
+            raise ValueError(f"[checks.{raw_language}].commands must be a non-empty array of argument arrays.")
+        normalized_commands: list[list[str]] = []
+        for command in commands:
+            if not isinstance(command, list) or not command or not all(
+                isinstance(arg, str) and arg for arg in command
+            ):
+                raise ValueError(f"Every command in [checks.{raw_language}] must be a non-empty string array.")
+            normalized_commands.append(command)
+        if not isinstance(patterns, list) or not patterns or not all(
+            isinstance(pattern, str) and pattern for pattern in patterns
+        ):
+            raise ValueError(f"[checks.{raw_language}].test_patterns must be a non-empty string array.")
+        if any(".." in Path(pattern).parts for pattern in patterns):
+            raise ValueError("Test patterns may not traverse outside the project root.")
+        configured[language] = LanguageConfig(normalized_commands, patterns)
+        required.add(language)
+
+    return required, configured
+
+
+def _matching_config_tests(root: Path, patterns: list[str]) -> bool:
+    for pattern in patterns:
+        try:
+            if any(path.is_file() for path in root.glob(pattern)):
+                return True
+        except (OSError, ValueError):
+            continue
+    return False
+
+
+def discover(root: Path) -> list[tuple[str, list[list[str]]]]:
+    """Return detected languages and their default commands."""
+    return list(_default_plans(root).items())
+
+
+def _failure_report(reason: str, language: str = "configuration") -> dict:
+    result = CheckResult(language, "FAIL", [], 2, 0.0, reason)
+    return {"status": "FAIL", "results": [asdict(result)]}
+
+
+def run_checks(
+    root: Path,
+    timeout: int = 120,
+    config_path: str | Path | None = None,
+) -> dict:
+    root = root.expanduser().resolve()
+    if timeout < 1:
+        return _failure_report("Timeout must be at least 1 second.")
+    if not root.is_dir():
+        return _failure_report("Project directory does not exist.", "project")
+
+    try:
+        required, configured = _load_config(root, config_path)
+    except ValueError as exc:
+        return _failure_report(str(exc))
+
+    plans = _default_plans(root)
+    for language in required:
+        plans.setdefault(language, [])
     if not plans:
-        return {
-            "status": "FAIL",
-            "results": [asdict(CheckResult("project", "FAIL", [], 2, 0.0, "No supported language project was detected."))],
-        }
+        return _failure_report("No supported language project was detected.", "project")
 
     results: list[CheckResult] = []
     files = _project_files(root)
-    for language, commands in plans:
-        if not _has_test(files, language):
+    for language, default_commands in sorted(plans.items()):
+        language_config = configured.get(language)
+        commands = language_config.commands if language_config else default_commands
+        if not commands:
             results.append(CheckResult(
-                language, "FAIL", commands, 2, 0.0,
-                "No test suite was detected; fail-closed policy rejects untested code.",
+                language, "FAIL", [], 2, 0.0,
+                "Language was required by configuration but no check commands were provided.",
             ))
+            continue
+
+        if language_config:
+            has_tests = _matching_config_tests(root, language_config.test_patterns)
+            test_reason = "Configured test_patterns did not match any files."
+        else:
+            has_tests = _has_test(files, language, root)
+            test_reason = "No test suite was detected; fail-closed policy rejects untested code."
+        if not has_tests:
+            results.append(CheckResult(language, "FAIL", commands, 2, 0.0, test_reason))
             continue
 
         started = time.monotonic()
@@ -201,13 +343,17 @@ def run_checks(root: Path, timeout: int = 120) -> dict:
         failure_reason = ""
         for command in commands:
             executable = command[0]
-            if executable.startswith("./"):
-                executable_path = root / executable[2:]
+            executable_path: Path | None = None
+            if Path(executable).is_absolute():
+                executable_path = Path(executable)
+            elif "/" in executable or executable.startswith(".\\"):
+                executable_path = (root / executable).resolve()
+            if executable_path is not None:
                 if not executable_path.exists():
                     last_code = 127
-                    failure_reason = f"Required test runner not found: {executable}"
+                    failure_reason = f"Required command not found: {executable}"
                     break
-            elif not Path(executable).is_absolute() and shutil.which(executable) is None:
+            elif shutil.which(executable) is None:
                 last_code = 127
                 failure_reason = f"Required tool not installed: {executable}"
                 break
@@ -221,6 +367,7 @@ def run_checks(root: Path, timeout: int = 120) -> dict:
                     stderr=subprocess.STDOUT,
                     timeout=timeout,
                     check=False,
+                    shell=False,
                 )
                 last_code = completed.returncode
                 if completed.stdout:
@@ -239,17 +386,13 @@ def run_checks(root: Path, timeout: int = 120) -> dict:
             except OSError as exc:
                 last_code = 126
                 failure_reason = f"Could not execute {' '.join(command)}: {exc}"
+                break
 
         elapsed = time.monotonic() - started
         passed = last_code == 0 and not failure_reason
         results.append(CheckResult(
-            language,
-            "PASS" if passed else "FAIL",
-            commands,
-            last_code,
-            round(elapsed, 3),
-            failure_reason,
-            "\n".join(output_parts)[-12000:],
+            language, "PASS" if passed else "FAIL", commands, last_code,
+            round(elapsed, 3), failure_reason, "\n".join(output_parts)[-12000:],
         ))
 
     status = "PASS" if results and all(item.status == "PASS" for item in results) else "FAIL"

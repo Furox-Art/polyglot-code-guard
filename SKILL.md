@@ -1,25 +1,34 @@
 ---
 name: polyglot-code-verification
-description: A fail-closed quality gate for AI-generated code across multiple programming languages.
+description: Verify AI-generated code with real project test commands and fail closed when tests are missing or fail.
 ---
 
-# Polyglot Code Verification Skill
+# Polyglot Code Verification
 
-This skill makes executable evidence mandatory before AI-generated code is accepted.
+Use this skill whenever code is generated, changed, refactored, or described as complete.
 
-Run the CLI from the target project:
+## Required workflow
 
-    polyguard verify --path . --details
+1. Identify all languages, build systems, packages, and project roots touched by the change.
+2. Review the user's requirements and create or update tests for normal behavior, edge cases, invalid inputs, error paths, and regressions.
+3. For conventional repositories, run `polyguard verify --path . --details`.
+4. For a custom layout or test runner, add a `.polyguard.toml` with explicit commands and test file patterns. Never use a command that simply prints success.
+5. Run the complete configured test suite. Do not omit a detected or required language.
+6. If any command fails, the toolchain is missing, tests cannot be found, configuration is invalid, or a timeout occurs, the final verdict is FAIL.
+7. Fix the implementation or tests and rerun all checks. Never delete, skip, weaken, or rewrite a valid test merely to obtain PASS.
+8. Retain command output and the JSON report when the user requests inspectable evidence.
 
-The default user-facing verdict is intentionally minimal:
+## Output contract
 
-- All detected language suites exist and all configured commands pass: PASS
-- A test fails, a required test suite is missing, a toolchain is unavailable, or execution times out: FAIL
+- All detected and required language checks pass: PASS
+- Any failure or incomplete verification: FAIL
 
-A zero exit code is required before reporting success. Exit code 1 means FAIL.
+The CLI exits 0 only for PASS and 1 for FAIL. The default output is exactly one word; use `--details` or `--json` for diagnostics.
 
-Do not infer correctness from code inspection alone. Do not omit failing languages. Do not weaken tests to manufacture a passing result. Add requirement-based tests for important edge cases and rerun the full suite.
+## Security
 
-Supported project types in this release: Python, Rust, Go, JavaScript/TypeScript, Java, C#, PHP, Ruby, Swift, and C/C++ projects using CMake.
+The verifier executes build tools, package managers, scripts, and tests from the target repository. Run untrusted code in a disposable container or isolated virtual machine without secrets, privileged access, or sensitive host mounts. Polyguard is not an operating-system sandbox.
 
-The verifier executes build and test scripts. Run unknown or untrusted code in a disposable sandbox with no secrets and no privileged host mounts. Polyguard does not itself provide operating-system isolation.
+## Scope
+
+Built-in support: Python, Rust, Go, JavaScript/TypeScript, Java, C#, PHP, Ruby, Swift, and C/C++ with CMake. Use project configuration for unconventional layouts, custom test runners, and monorepos.
