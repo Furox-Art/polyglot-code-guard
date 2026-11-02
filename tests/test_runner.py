@@ -2,6 +2,8 @@ from pathlib import Path
 import json
 import sys
 
+import pytest
+
 from polyguard.runner import (
     _execution_evidence,
     _has_test,
@@ -145,7 +147,7 @@ def test_custom_config_requires_execution_evidence(tmp_path: Path) -> None:
     assert "could not verify" in report["results"][0]["reason"].lower()
 
 
-def test_custom_config_can_parse_trusted_test_summary(tmp_path: Path) -> None:
+def test_custom_success_patterns_cannot_manufacture_pass(tmp_path: Path) -> None:
     (tmp_path / "app.py").write_text("print('app')\n", encoding="utf-8")
     tests_dir = tmp_path / "custom-tests"
     tests_dir.mkdir()
@@ -159,8 +161,8 @@ def test_custom_config_can_parse_trusted_test_summary(tmp_path: Path) -> None:
         encoding="utf-8",
     )
     report = run_checks(tmp_path)
-    assert report["status"] == "PASS"
-    assert report["results"][0]["tests_passed"] == 2
+    assert report["status"] == "FAIL"
+    assert "success_patterns is no longer supported" in report["results"][0]["reason"]
 
 
 def test_custom_command_failure_is_fail(tmp_path: Path) -> None:
@@ -193,7 +195,7 @@ def test_config_test_patterns_must_match(tmp_path: Path) -> None:
     assert "did not match" in report["results"][0]["reason"]
 
 
-def test_invalid_success_regex_fails_closed(tmp_path: Path) -> None:
+def test_custom_success_pattern_is_rejected_even_when_regex_is_valid(tmp_path: Path) -> None:
     (tmp_path / "app.py").write_text("print('app')\n", encoding="utf-8")
     tests_dir = tmp_path / "tests"
     tests_dir.mkdir()
@@ -207,7 +209,7 @@ def test_invalid_success_regex_fails_closed(tmp_path: Path) -> None:
     )
     report = run_checks(tmp_path)
     assert report["status"] == "FAIL"
-    assert "Invalid success regex" in report["results"][0]["reason"]
+    assert "success_patterns is no longer supported" in report["results"][0]["reason"]
 
 
 def test_invalid_config_fails_closed(tmp_path: Path) -> None:
@@ -275,3 +277,651 @@ def test_all_skipped_pytest_suite_fails_closed(tmp_path: Path) -> None:
     report = run_checks(tmp_path)
     assert report["status"] == "FAIL"
     assert "could not verify" in report["results"][0]["reason"].lower()
+
+
+def test_monorepo_runs_each_language_from_its_own_project_root(tmp_path: Path, monkeypatch) -> None:
+    from types import SimpleNamespace
+    import polyguard.runner as runner
+
+    projects = {
+        "apps/api": ("pyproject.toml", "tests/test_api.py", "def test_api(): assert 2 + 2 == 4\n"),
+        "services/worker": ("go.mod", "worker_test.go", "package worker\nfunc TestWorker(t *testing.T) {}\n"),
+        "libs/core": ("Cargo.toml", "src/lib.rs", "#[cfg(test)] mod tests { #[test] fn core_works() {} }\n"),
+    }
+    for directory, (manifest, test_path, content) in projects.items():
+        (tmp_path / directory / manifest).parent.mkdir(parents=True, exist_ok=True)
+        (tmp_path / directory / manifest).write_text(
+            '[package]\nname = "fixture"\nversion = "0.1.0"\nedition = "2021"\n'
+            if manifest == "Cargo.toml"
+            else "module example.com/worker\ngo 1.22\n"
+            if manifest == "go.mod"
+            else "[project]\nname = 'api-fixture'\n",
+            encoding="utf-8",
+        )
+        target = tmp_path / directory / test_path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(content, encoding="utf-8")
+
+    calls = []
+
+    def fake_run(command, *, cwd, **kwargs):
+        calls.append((command, Path(cwd)))
+        if "pytest" in command:
+            output = "1 passed in 0.01s"
+        elif command[0] == "cargo":
+            output = "test result: ok. 1 passed; 0 failed; 0 ignored"
+        elif command[0] == "go":
+            output = json.dumps({"Action": "pass", "Test": "TestWorker"})
+        else:
+            output = ""
+        return SimpleNamespace(returncode=0, stdout=output)
+
+    monkeypatch.setattr(runner.subprocess, "run", fake_run)
+    monkeypatch.setattr(runner.shutil, "which", lambda executable: f"/fake/{executable}")
+
+    report = run_checks(tmp_path)
+
+    assert report["status"] == "PASS", report
+    assert {(item["language"], Path(item["project_root"]).relative_to(tmp_path).as_posix())
+            for item in report["results"]} == {
+        ("python", "apps/api"),
+        ("go", "services/worker"),
+        ("rust", "libs/core"),
+    }
+    assert {cwd.relative_to(tmp_path).as_posix() for _, cwd in calls} == {
+        "apps/api",
+        "services/worker",
+        "libs/core",
+    }
+
+
+def test_monorepo_keeps_same_language_packages_separate(tmp_path: Path, monkeypatch) -> None:
+    from types import SimpleNamespace
+    import polyguard.runner as runner
+
+    expected_roots = {"packages/one", "packages/two"}
+    for directory in expected_roots:
+        package = tmp_path / directory
+        package.mkdir(parents=True)
+        (package / "pyproject.toml").write_text("[project]\nname = 'fixture'\n", encoding="utf-8")
+        tests_dir = package / "tests"
+        tests_dir.mkdir()
+        (tests_dir / "test_app.py").write_text("def test_ok(): assert True\n", encoding="utf-8")
+
+    calls = []
+
+    def fake_run(command, *, cwd, **kwargs):
+        calls.append(Path(cwd))
+        return SimpleNamespace(returncode=0, stdout="1 passed in 0.01s" if "pytest" in command else "")
+
+    monkeypatch.setattr(runner.subprocess, "run", fake_run)
+    report = run_checks(tmp_path)
+
+    assert report["status"] == "PASS", report
+    assert len(report["results"]) == 2
+    assert {Path(item["project_root"]).relative_to(tmp_path).as_posix() for item in report["results"]} == expected_roots
+    assert {path.relative_to(tmp_path).as_posix() for path in calls} == expected_roots
+
+
+def test_one_failing_package_makes_monorepo_fail(tmp_path: Path, monkeypatch) -> None:
+    from types import SimpleNamespace
+    import polyguard.runner as runner
+
+    for directory in ("packages/healthy", "packages/broken"):
+        package = tmp_path / directory
+        package.mkdir(parents=True)
+        (package / "pyproject.toml").write_text("[project]\nname = 'fixture'\n", encoding="utf-8")
+        tests_dir = package / "tests"
+        tests_dir.mkdir()
+        (tests_dir / "test_app.py").write_text("def test_ok(): assert True\n", encoding="utf-8")
+
+    def fake_run(command, *, cwd, **kwargs):
+        if "pytest" in command and Path(cwd).name == "broken":
+            return SimpleNamespace(returncode=1, stdout="1 failed")
+        return SimpleNamespace(returncode=0, stdout="1 passed" if "pytest" in command else "")
+
+    monkeypatch.setattr(runner.subprocess, "run", fake_run)
+    report = run_checks(tmp_path)
+
+    assert report["status"] == "FAIL"
+    assert {item["status"] for item in report["results"]} == {"PASS", "FAIL"}
+
+
+def test_monorepo_workspace_manifest_does_not_create_empty_parent_unit(tmp_path: Path, monkeypatch) -> None:
+    from types import SimpleNamespace
+    import polyguard.runner as runner
+
+    (tmp_path / "pyproject.toml").write_text("[project]\nname = 'workspace'\n", encoding="utf-8")
+    package = tmp_path / "packages" / "api"
+    package.mkdir(parents=True)
+    (package / "pyproject.toml").write_text("[project]\nname = 'api'\n", encoding="utf-8")
+    tests_dir = package / "tests"
+    tests_dir.mkdir()
+    (tests_dir / "test_api.py").write_text("def test_ok(): assert True\n", encoding="utf-8")
+
+    monkeypatch.setattr(
+        runner.subprocess, "run",
+        lambda command, *, cwd, **kwargs: SimpleNamespace(
+            returncode=0, stdout="1 passed" if "pytest" in command else ""
+        ),
+    )
+    report = run_checks(tmp_path)
+
+    assert report["status"] == "PASS", report
+    assert len(report["results"]) == 1
+    assert Path(report["results"][0]["project_root"]) == package
+
+
+def test_parent_python_package_does_not_execute_nested_package_tests(tmp_path: Path, monkeypatch) -> None:
+    from types import SimpleNamespace
+    import polyguard.runner as runner
+
+    (tmp_path / "pyproject.toml").write_text("[project]\nname = 'workspace'\n", encoding="utf-8")
+    parent_tests = tmp_path / "tests"
+    parent_tests.mkdir()
+    (parent_tests / "test_parent.py").write_text("def test_parent(): assert True\n", encoding="utf-8")
+
+    child = tmp_path / "packages" / "child"
+    child_tests = child / "tests"
+    child_tests.mkdir(parents=True)
+    (child / "pyproject.toml").write_text("[project]\nname = 'child'\n", encoding="utf-8")
+    (child_tests / "test_child.py").write_text("def test_child(): assert True\n", encoding="utf-8")
+
+    calls = []
+
+    def fake_run(command, *, cwd, **kwargs):
+        if "pytest" in command:
+            calls.append((Path(cwd), command))
+            return SimpleNamespace(returncode=0, stdout="1 passed")
+        return SimpleNamespace(returncode=0, stdout="")
+
+    monkeypatch.setattr(runner.subprocess, "run", fake_run)
+    report = run_checks(tmp_path)
+
+    assert report["status"] == "PASS", report
+    parent_command = next(command for cwd, command in calls if cwd == tmp_path)
+    child_command = next(command for cwd, command in calls if cwd == child)
+    assert "tests/test_parent.py" in parent_command
+    assert "packages/child/tests/test_child.py" not in parent_command
+    assert "tests/test_child.py" in child_command
+
+
+def test_junit_xml_counts_pass_fail_and_skip(tmp_path: Path) -> None:
+    from polyguard.runner import _parse_junit_xml
+
+    report = tmp_path / "junit.xml"
+    report.write_text(
+        '<testsuites tests="3" failures="1" errors="0" skipped="1">'
+        '<testsuite name="suite" tests="3" failures="1" errors="0" skipped="1">'
+        '<testcase name="pass"/><testcase name="fail"><failure/></testcase>'
+        '<testcase name="skip"><skipped/></testcase>'
+        '</testsuite></testsuites>',
+        encoding="utf-8",
+    )
+    assert _parse_junit_xml(report) == (3, 1, 1)
+
+
+def test_trx_counts_pass_fail_and_not_executed(tmp_path: Path) -> None:
+    from polyguard.runner import _parse_trx
+
+    report = tmp_path / "results.trx"
+    report.write_text(
+        '<TestRun><ResultSummary><Counters total="3" executed="2" passed="1" '
+        'failed="1" error="0" aborted="0" timeout="0" notExecuted="1" '
+        'inconclusive="0" notRunnable="0"/></ResultSummary></TestRun>',
+        encoding="utf-8",
+    )
+    assert _parse_trx(report) == (3, 1, 1)
+
+
+def test_csharp_exit_zero_without_fresh_trx_report_fails_closed(tmp_path: Path, monkeypatch) -> None:
+    from types import SimpleNamespace
+    import polyguard.runner as runner
+
+    (tmp_path / "Fixture.csproj").write_text("<Project />", encoding="utf-8")
+    tests_dir = tmp_path / "Tests"
+    tests_dir.mkdir()
+    (tests_dir / "AdditionTests.cs").write_text(
+        "public class AdditionTests { [Fact] public void AdditionWorks() {} }",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(runner.shutil, "which", lambda executable: f"/fake/{executable}")
+    monkeypatch.setattr(
+        runner.subprocess,
+        "run",
+        lambda command, **kwargs: SimpleNamespace(
+            returncode=0,
+            stdout="Passed! - Failed: 0, Passed: 1, Skipped: 0, Total: 1",
+        ),
+    )
+    report = runner.run_checks(tmp_path)
+    assert report["status"] == "FAIL"
+    assert "No fresh csharp test report" in report["results"][0]["reason"]
+
+
+def test_csharp_all_skipped_trx_report_fails_closed(tmp_path: Path, monkeypatch) -> None:
+    from types import SimpleNamespace
+    import polyguard.runner as runner
+
+    (tmp_path / "Fixture.csproj").write_text("<Project />", encoding="utf-8")
+    tests_dir = tmp_path / "Tests"
+    tests_dir.mkdir()
+    (tests_dir / "AdditionTests.cs").write_text(
+        "public class AdditionTests { [Fact] public void AdditionWorks() {} }",
+        encoding="utf-8",
+    )
+
+    def fake_run(command, *, cwd, **kwargs):
+        result_dir = Path(cwd) / ".polyguard-results"
+        result_dir.mkdir(exist_ok=True)
+        (result_dir / "polyguard.trx").write_text(
+            '<TestRun><ResultSummary><Counters total="1" executed="0" passed="0" '
+            'failed="0" error="0" notExecuted="1"/></ResultSummary></TestRun>',
+            encoding="utf-8",
+        )
+        return SimpleNamespace(returncode=0, stdout="Build succeeded.")
+
+    monkeypatch.setattr(runner.shutil, "which", lambda executable: f"/fake/{executable}")
+    monkeypatch.setattr(runner.subprocess, "run", fake_run)
+    report = runner.run_checks(tmp_path)
+    assert report["status"] == "FAIL"
+    assert report["results"][0]["tests_passed"] == 0
+    assert report["results"][0]["tests_skipped"] == 1
+
+
+def test_npm_workspace_runs_once_from_workspace_root(tmp_path: Path, monkeypatch) -> None:
+    from types import SimpleNamespace
+    import polyguard.runner as runner
+
+    (tmp_path / "package.json").write_text(
+        json.dumps({
+            "name": "root-workspace",
+            "private": True,
+            "workspaces": ["packages/*"],
+            "scripts": {"test": "echo root"},
+        }),
+        encoding="utf-8",
+    )
+    package = tmp_path / "packages" / "api"
+    package.mkdir(parents=True)
+    (package / "package.json").write_text(
+        json.dumps({"name": "api", "scripts": {"test": "node --test"}}),
+        encoding="utf-8",
+    )
+    tests_dir = package / "test"
+    tests_dir.mkdir()
+    (tests_dir / "api.test.js").write_text(
+        "test('api works', () => {});",
+        encoding="utf-8",
+    )
+    calls = []
+
+    def fake_run(command, *, cwd, **kwargs):
+        calls.append((command, Path(cwd)))
+        return SimpleNamespace(
+            returncode=0,
+            stdout="# tests 1\n# pass 1\n# fail 0\n",
+        )
+
+    monkeypatch.setattr(runner.subprocess, "run", fake_run)
+    monkeypatch.setattr(runner.shutil, "which", lambda executable: f"/fake/{executable}")
+    report = runner.run_checks(tmp_path)
+
+    assert report["status"] == "PASS", report
+    assert len(report["results"]) == 1
+    assert Path(report["results"][0]["project_root"]) == tmp_path
+    assert len(calls) == 1
+    assert "--workspaces" in calls[0][0]
+
+
+def test_cargo_workspace_runs_once_from_workspace_root(tmp_path: Path, monkeypatch) -> None:
+    from types import SimpleNamespace
+    import polyguard.runner as runner
+
+    (tmp_path / "Cargo.toml").write_text(
+        '[workspace]\nmembers = ["crates/*"]\nresolver = "2"\n',
+        encoding="utf-8",
+    )
+    member = tmp_path / "crates" / "api"
+    (member / "src").mkdir(parents=True)
+    (member / "Cargo.toml").write_text(
+        '[package]\nname = "api"\nversion = "0.1.0"\nedition = "2021"\n',
+        encoding="utf-8",
+    )
+    (member / "src" / "lib.rs").write_text(
+        "#[cfg(test)] mod tests { #[test] fn works() {} }\n",
+        encoding="utf-8",
+    )
+    calls = []
+
+    def fake_run(command, *, cwd, **kwargs):
+        calls.append((command, Path(cwd)))
+        return SimpleNamespace(
+            returncode=0,
+            stdout="test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out\n",
+        )
+
+    monkeypatch.setattr(runner.subprocess, "run", fake_run)
+    monkeypatch.setattr(runner.shutil, "which", lambda executable: f"/fake/{executable}")
+    report = runner.run_checks(tmp_path)
+
+    assert report["status"] == "PASS", report
+    assert len(report["results"]) == 1
+    assert Path(report["results"][0]["project_root"]) == tmp_path
+    assert len(calls) == 1
+    assert "--workspace" in calls[0][0]
+
+
+def test_maven_modules_run_once_from_aggregator_root(tmp_path: Path, monkeypatch) -> None:
+    from types import SimpleNamespace
+    import polyguard.runner as runner
+
+    (tmp_path / "pom.xml").write_text(
+        "<project><modelVersion>4.0.0</modelVersion><modules><module>modules/api</module></modules></project>",
+        encoding="utf-8",
+    )
+    member = tmp_path / "modules" / "api"
+    test_file = member / "src" / "test" / "java" / "ApiTest.java"
+    test_file.parent.mkdir(parents=True)
+    (member / "pom.xml").write_text("<project><modelVersion>4.0.0</modelVersion></project>", encoding="utf-8")
+    test_file.write_text("class ApiTest { @Test void apiWorks() {} }", encoding="utf-8")
+    calls = []
+
+    def fake_run(command, *, cwd, **kwargs):
+        calls.append((command, Path(cwd)))
+        report_dir = member / "target" / "surefire-reports"
+        report_dir.mkdir(parents=True)
+        (report_dir / "TEST-ApiTest.xml").write_text(
+            '<testsuite name="ApiTest" tests="1" failures="0" errors="0" skipped="0">'
+            '<testcase name="apiWorks"/></testsuite>',
+            encoding="utf-8",
+        )
+        return SimpleNamespace(returncode=0, stdout="")
+
+    monkeypatch.setattr(runner.subprocess, "run", fake_run)
+    monkeypatch.setattr(runner.shutil, "which", lambda executable: f"/fake/{executable}")
+    report = runner.run_checks(tmp_path)
+
+    assert report["status"] == "PASS", report
+    assert len(report["results"]) == 1
+    assert Path(report["results"][0]["project_root"]) == tmp_path
+    assert report["results"][0]["tests_passed"] == 1
+    assert len(calls) == 1
+    assert calls[0][1] == tmp_path
+
+
+def test_gradle_settings_aggregator_runs_once_at_root(tmp_path: Path, monkeypatch) -> None:
+    from types import SimpleNamespace
+    import polyguard.runner as runner
+
+    (tmp_path / "settings.gradle").write_text('rootProject.name = "workspace"\ninclude(":api")\n', encoding="utf-8")
+    member = tmp_path / "api"
+    test_file = member / "src" / "test" / "java" / "ApiTest.java"
+    test_file.parent.mkdir(parents=True)
+    (member / "build.gradle").write_text("plugins { id 'java' }\n", encoding="utf-8")
+    test_file.write_text("class ApiTest { @Test void apiWorks() {} }", encoding="utf-8")
+    calls = []
+
+    def fake_run(command, *, cwd, **kwargs):
+        calls.append((command, Path(cwd)))
+        report_dir = member / "build" / "test-results" / "test"
+        report_dir.mkdir(parents=True)
+        (report_dir / "TEST-ApiTest.xml").write_text(
+            '<testsuite name="ApiTest" tests="1" failures="0" errors="0" skipped="0">'
+            '<testcase name="apiWorks"/></testsuite>',
+            encoding="utf-8",
+        )
+        return SimpleNamespace(returncode=0, stdout="")
+
+    monkeypatch.setattr(runner.subprocess, "run", fake_run)
+    monkeypatch.setattr(runner.shutil, "which", lambda executable: f"/fake/{executable}")
+    report = runner.run_checks(tmp_path)
+
+    assert report["status"] == "PASS", report
+    assert len(report["results"]) == 1
+    assert Path(report["results"][0]["project_root"]) == tmp_path
+    assert len(calls) == 1
+    assert calls[0][1] == tmp_path
+    assert calls[0][0][0] == "gradle"
+
+
+def test_dotnet_solution_runs_child_projects_once(tmp_path: Path, monkeypatch) -> None:
+    from types import SimpleNamespace
+    import polyguard.runner as runner
+
+    (tmp_path / "Workspace.sln").write_text("Microsoft Visual Studio Solution File\n", encoding="utf-8")
+    member = tmp_path / "tests" / "Api.Tests"
+    member.mkdir(parents=True)
+    (member / "Api.Tests.csproj").write_text("<Project />", encoding="utf-8")
+    (member / "AdditionTests.cs").write_text("public class AdditionTests { [Fact] public void Works() {} }", encoding="utf-8")
+    calls = []
+
+    def fake_run(command, *, cwd, **kwargs):
+        calls.append((command, Path(cwd)))
+        report_dir = Path(cwd) / ".polyguard-results"
+        report_dir.mkdir(exist_ok=True)
+        (report_dir / "polyguard.trx").write_text(
+            '<TestRun><ResultSummary><Counters total="1" executed="1" passed="1" '
+            'failed="0" error="0" notExecuted="0"/></ResultSummary></TestRun>',
+            encoding="utf-8",
+        )
+        return SimpleNamespace(returncode=0, stdout="")
+
+    monkeypatch.setattr(runner.subprocess, "run", fake_run)
+    monkeypatch.setattr(runner.shutil, "which", lambda executable: f"/fake/{executable}")
+    report = runner.run_checks(tmp_path)
+
+    assert report["status"] == "PASS", report
+    assert len(report["results"]) == 1
+    assert Path(report["results"][0]["project_root"]) == tmp_path
+    assert len(calls) == 1
+    assert calls[0][1] == tmp_path
+
+
+def test_java_native_report_must_be_created_during_current_run(tmp_path: Path, monkeypatch) -> None:
+    from types import SimpleNamespace
+    import os
+    import time
+    import polyguard.runner as runner
+
+    (tmp_path / "pom.xml").write_text("<project/>", encoding="utf-8")
+    tests_dir = tmp_path / "src" / "test" / "java"
+    tests_dir.mkdir(parents=True)
+    (tests_dir / "MathTest.java").write_text("@Test class MathTest {}", encoding="utf-8")
+    stale = tmp_path / "target" / "surefire-reports" / "TEST-stale.xml"
+    stale.parent.mkdir(parents=True)
+    stale.write_text('<testsuite tests="1" failures="0" skipped="0"/>', encoding="utf-8")
+    old = time.time() - 60
+    os.utime(stale, (old, old))
+
+    monkeypatch.setattr(runner.shutil, "which", lambda executable: f"/fake/{executable}")
+    monkeypatch.setattr(
+        runner.subprocess, "run",
+        lambda command, **kwargs: SimpleNamespace(returncode=0, stdout="BUILD SUCCESS"),
+    )
+    report = runner.run_checks(tmp_path)
+    assert report["status"] == "FAIL"
+    assert "No fresh java test report" in report["results"][0]["reason"]
+
+
+def test_junit_aggregate_counters_without_testcases_are_not_evidence(tmp_path: Path) -> None:
+    from polyguard.runner import _parse_junit_xml
+
+    report = tmp_path / "empty.xml"
+    report.write_text(
+        '<testsuites tests="8" failures="0" errors="0" skipped="0">'
+        '<testsuite name="empty" tests="8" failures="0" errors="0" skipped="0"/>'
+        '</testsuites>',
+        encoding="utf-8",
+    )
+    assert _parse_junit_xml(report) == (0, 0, 0)
+
+
+def test_files_for_unit_does_not_exclude_nested_different_language_project(tmp_path: Path) -> None:
+    from polyguard.runner import ProjectUnit, _files_for_unit
+
+    root = tmp_path
+    parent = root / "pyproject.toml"
+    parent.write_text("[project]\nname='root'\n", encoding="utf-8")
+    child = root / "services" / "java"
+    child.mkdir(parents=True)
+    (child / "pom.xml").write_text("<project/>", encoding="utf-8")
+    python_test = child / "test_bridge.py"
+    python_test.write_text("def test_bridge(): assert True\n", encoding="utf-8")
+    units = [ProjectUnit(root, "python"), ProjectUnit(child, "java")]
+    files = _files_for_unit(root, units[0], units)
+    assert python_test in files
+
+
+def test_swift_default_plan_uses_native_test_runner_summary(tmp_path: Path) -> None:
+    from polyguard.runner import _default_plans
+
+    (tmp_path / "Package.swift").write_text("// swift-tools-version: 6.0\n", encoding="utf-8")
+    plans = _default_plans(tmp_path, [tmp_path / "Package.swift"])
+    command = plans["swift"][0]
+    assert command == ["swift", "test", "--parallel"]
+
+
+def test_windows_maven_wrapper_uses_cmd(tmp_path: Path, monkeypatch) -> None:
+    import polyguard.runner as runner
+
+    (tmp_path / "pom.xml").write_text("<project/>", encoding="utf-8")
+    (tmp_path / "mvnw.cmd").write_text("@echo off\n", encoding="utf-8")
+    monkeypatch.setattr(runner.sys, "platform", "win32")
+    command = runner._default_plans(tmp_path, [tmp_path / "pom.xml", tmp_path / "mvnw.cmd"])["java"][0]
+    assert command[:3] == ["cmd", "/c", "mvnw.cmd"]
+
+
+def test_windows_gradle_wrapper_uses_cmd(tmp_path: Path, monkeypatch) -> None:
+    import polyguard.runner as runner
+
+    (tmp_path / "settings.gradle").write_text("rootProject.name='fixture'\n", encoding="utf-8")
+    (tmp_path / "gradlew.bat").write_text("@echo off\n", encoding="utf-8")
+    monkeypatch.setattr(runner.sys, "platform", "win32")
+    command = runner._default_plans(
+        tmp_path, [tmp_path / "settings.gradle", tmp_path / "gradlew.bat"]
+    )["java"][0]
+    assert command[:3] == ["cmd", "/c", "gradlew.bat"]
+
+
+def test_trx_inconsistent_counters_fail_closed(tmp_path: Path) -> None:
+    import pytest
+    from polyguard.runner import _parse_trx
+
+    report = tmp_path / "inconsistent.trx"
+    report.write_text(
+        '<TestRun><ResultSummary><Counters total="4" passed="2" failed="0" '
+        'error="0" notExecuted="1"/></ResultSummary></TestRun>',
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="do not reconcile"):
+        _parse_trx(report)
+
+
+def test_mixed_c_cpp_cmake_invocation_runs_once(tmp_path: Path, monkeypatch) -> None:
+    from types import SimpleNamespace
+    import polyguard.runner as runner
+
+    (tmp_path / "CMakeLists.txt").write_text(
+        "cmake_minimum_required(VERSION 3.16)\nproject(mixed C CXX)\n"
+        "enable_testing()\nadd_executable(test_c tests/test_c.c)\n"
+        "add_executable(test_cpp tests/test_cpp.cpp)\n"
+        "add_test(NAME c_math COMMAND test_c)\nadd_test(NAME cpp_math COMMAND test_cpp)\n",
+        encoding="utf-8",
+    )
+    tests_dir = tmp_path / "tests"
+    tests_dir.mkdir()
+    (tests_dir / "test_c.c").write_text("#include <assert.h>\nint main(){assert(1);}\n", encoding="utf-8")
+    (tests_dir / "test_cpp.cpp").write_text("#include <cassert>\nint main(){assert(1);}\n", encoding="utf-8")
+    calls = []
+
+    def fake_run(command, *, cwd, **kwargs):
+        calls.append(command)
+        if command[0] == "ctest":
+            return SimpleNamespace(returncode=0, stdout="100% tests passed, 0 tests failed out of 2\n")
+        return SimpleNamespace(returncode=0, stdout="")
+
+    monkeypatch.setattr(runner.subprocess, "run", fake_run)
+    monkeypatch.setattr(runner.shutil, "which", lambda executable: f"/fake/{executable}")
+    report = runner.run_checks(tmp_path)
+
+    assert report["status"] == "PASS", report
+    assert [item["language"] for item in report["results"]] == ["c", "cpp"]
+    assert sum(1 for command in calls if command[0] == "ctest") == 1
+
+
+def test_ruby_gemspec_alone_is_discovered(tmp_path: Path) -> None:
+    from polyguard.runner import _discover_project_units
+
+    (tmp_path / "example.gemspec").write_text(
+        "Gem::Specification.new do |spec|\n  spec.name = 'example'\nend\n",
+        encoding="utf-8",
+    )
+    units = _discover_project_units(tmp_path)
+    assert any(unit.language == "ruby" and unit.root == tmp_path for unit in units)
+
+
+@pytest.mark.parametrize("language", ["php", "csharp", "swift"])
+def test_nested_native_report_projects_pass_from_their_own_root(
+    tmp_path: Path, monkeypatch, language: str
+) -> None:
+    from types import SimpleNamespace
+    import polyguard.runner as runner
+
+    project = tmp_path / "services" / language
+    project.mkdir(parents=True)
+    if language == "php":
+        (project / "composer.json").write_text(
+            '{"require-dev":{"phpunit/phpunit":"^12.0"}}', encoding="utf-8"
+        )
+        tests = project / "tests"
+        tests.mkdir()
+        (tests / "ExampleTest.php").write_text(
+            '<?php class ExampleTest extends \\PHPUnit\\Framework\\TestCase '
+            '{ public function testWorks(): void {} }', encoding="utf-8"
+        )
+    elif language == "csharp":
+        (project / "Fixture.csproj").write_text('<Project />', encoding="utf-8")
+        tests = project / "Tests"
+        tests.mkdir()
+        (tests / "ExampleTests.cs").write_text(
+            'public class ExampleTests { [Fact] public void Works() {} }', encoding="utf-8"
+        )
+    else:
+        (project / "Package.swift").write_text(
+            '// swift-tools-version: 5.9\nimport PackageDescription\n'
+            'let package = Package(name: "Fixture", targets: '
+            '[.target(name: "Fixture"), .testTarget(name: "FixtureTests", dependencies: ["Fixture"])])\n',
+            encoding="utf-8",
+        )
+        _swift_tests = project / "Tests" / "FixtureTests"
+        _swift_tests.mkdir(parents=True)
+        (_swift_tests / "ExampleTests.swift").write_text(
+            'import Testing\n@Test func works() {}\n', encoding="utf-8"
+        )
+
+    def fake_run(command, *, cwd, **kwargs):
+        result_dir = Path(cwd) / ".polyguard-results"
+        result_dir.mkdir(parents=True, exist_ok=True)
+        if language == "csharp":
+            (result_dir / "polyguard.trx").write_text(
+                '<TestRun><ResultSummary><Counters total="1" executed="1" passed="1" '
+                'failed="0" error="0" notExecuted="0" inconclusive="0" notRunnable="0"/>'
+                '</ResultSummary></TestRun>', encoding="utf-8"
+            )
+        elif language == "php":
+            (result_dir / "phpunit.xml").write_text(
+                '<testsuites><testsuite><testcase name="works"/></testsuite></testsuites>',
+                encoding="utf-8"
+            )
+        output = "Test run with 1 test in 1 suite passed." if language == "swift" else "Build succeeded."
+        return SimpleNamespace(returncode=0, stdout=output)
+
+    monkeypatch.setattr(runner.shutil, "which", lambda executable: f"/fake/{executable}")
+    monkeypatch.setattr(runner.subprocess, "run", fake_run)
+    report = runner.run_checks(tmp_path)
+
+    assert report["status"] == "PASS", report
+    assert len(report["results"]) == 1
+    assert Path(report["results"][0]["project_root"]) == project
+    assert report["results"][0]["tests_passed"] == 1
