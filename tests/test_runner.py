@@ -131,6 +131,8 @@ def test_go_json_evidence_rejects_invalid_event_fields() -> None:
         {"Action": "pass", "Package": []},
         {"Action": "pass", "Test": "TestAdd", "Elapsed": -1},
         {"Action": "pass", "Test": "TestAdd", "Elapsed": True},
+        {"Action": "pass", "Test": "TestAdd", "Elapsed": float("nan")},
+        {"Action": "pass", "Test": "TestAdd", "Elapsed": float("inf")},
     ]
     for event in invalid:
         assert _execution_evidence("go", json.dumps(event))[0] is None
@@ -300,8 +302,9 @@ def test_command_output_capture_is_bounded_and_keeps_the_tail(tmp_path: Path) ->
 
     assert completed.returncode == 0
     assert len(encoded) <= runner.MAX_COMMAND_OUTPUT_BYTES
-    assert completed.stdout.endswith("\nFINAL-OUTPUT-MARKER\n")
-    assert "FINAL-OUTPUT-MARKER" in completed.stdout
+    normalized_output = completed.stdout.replace("\r\n", "\n")
+    assert normalized_output.endswith("\nFINAL-OUTPUT-MARKER\n")
+    assert "FINAL-OUTPUT-MARKER" in normalized_output
 
 
 @pytest.mark.skipif(sys.platform != "linux", reason="Linux /proc process-state check")
