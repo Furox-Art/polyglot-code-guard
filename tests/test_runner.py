@@ -109,6 +109,10 @@ def test_ruby_evidence_rejects_skipped_only_suite() -> None:
     assert _execution_evidence("ruby", skipped)[0] is None
 
 
+def test_go_json_evidence_rejects_non_object_event() -> None:
+    assert _execution_evidence("go", "[]")[0] is None
+
+
 def test_go_json_evidence_counts_pass_events() -> None:
     output = "\n".join([
         json.dumps({"Action": "run", "Test": "TestAdd"}),
@@ -259,6 +263,79 @@ def test_timeout_validation_fails_closed(tmp_path: Path) -> None:
     assert report["status"] == "FAIL"
 
 
+def test_windows_timeout_uses_taskkill_process_tree(monkeypatch) -> None:
+    from types import SimpleNamespace
+    import polyguard.runner as runner
+
+    calls = []
+    state = {"alive": True}
+    process = SimpleNamespace(
+        pid=4321,
+        poll=lambda: None if state["alive"] else 1,
+        kill=lambda: calls.append("direct-kill"),
+    )
+
+    def fake_run(command, **kwargs):
+        calls.append((command, kwargs))
+        state["alive"] = False
+        return SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr(runner.os, "name", "nt")
+    monkeypatch.setattr(runner.subprocess, "run", fake_run)
+    runner._terminate_process_tree(process)
+
+    command, kwargs = calls[0]
+    assert command == ["taskkill", "/PID", "4321", "/T", "/F"]
+    assert kwargs["timeout"] == 10
+    assert "direct-kill" not in calls
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="Linux /proc process-state check")
+def test_timeout_terminates_descendant_processes(tmp_path: Path) -> None:
+    import json
+    import time
+
+    (tmp_path / "app.py").write_text("print('app')\n", encoding="utf-8")
+    tests_dir = tmp_path / "tests"
+    tests_dir.mkdir()
+    (tests_dir / "test_marker.py").write_text("# configured test marker\n", encoding="utf-8")
+    pid_file = tmp_path / "child.pid"
+    child_script = (
+        "import subprocess, sys, time; "
+        "child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)']); "
+        "open(sys.argv[1], 'w', encoding='utf-8').write(str(child.pid)); "
+        "time.sleep(60)"
+    )
+    config = tmp_path / ".polyguard.toml"
+    config.write_text(
+        "[checks.python]\n"
+        f"commands = [[{json.dumps(sys.executable)}, '-c', {json.dumps(child_script)}, "
+        f"{json.dumps(str(pid_file))}]]\n"
+        'test_patterns = ["tests/test_marker.py"]\n',
+        encoding="utf-8",
+    )
+
+    report = run_checks(tmp_path, timeout=1)
+    assert report["status"] == "FAIL"
+    assert "timed out" in report["results"][0]["reason"].lower()
+    assert pid_file.exists(), "The parent command did not launch its child process."
+    child_pid = int(pid_file.read_text(encoding="utf-8"))
+
+    deadline = time.monotonic() + 3
+    child_running = True
+    while time.monotonic() < deadline:
+        stat_file = Path(f"/proc/{child_pid}/stat")
+        if not stat_file.exists():
+            child_running = False
+            break
+        fields = stat_file.read_text(encoding="utf-8").split()
+        if len(fields) > 2 and fields[2] == "Z":
+            child_running = False
+            break
+        time.sleep(0.05)
+    assert not child_running, f"Timed-out command left child process {child_pid} running."
+
+
 def test_report_default_is_one_word() -> None:
     report = {"status": "FAIL", "results": []}
     assert render_report(report) == "FAIL"
@@ -327,7 +404,7 @@ def test_monorepo_runs_each_language_from_its_own_project_root(tmp_path: Path, m
             output = ""
         return SimpleNamespace(returncode=0, stdout=output)
 
-    monkeypatch.setattr(runner.subprocess, "run", fake_run)
+    monkeypatch.setattr(runner, "_run_command", fake_run)
     monkeypatch.setattr(runner.shutil, "which", lambda executable: f"/fake/{executable}")
 
     report = run_checks(tmp_path)
@@ -365,7 +442,7 @@ def test_monorepo_keeps_same_language_packages_separate(tmp_path: Path, monkeypa
         calls.append(Path(cwd))
         return SimpleNamespace(returncode=0, stdout="1 passed in 0.01s" if "pytest" in command else "")
 
-    monkeypatch.setattr(runner.subprocess, "run", fake_run)
+    monkeypatch.setattr(runner, "_run_command", fake_run)
     report = run_checks(tmp_path)
 
     assert report["status"] == "PASS", report
@@ -391,7 +468,7 @@ def test_one_failing_package_makes_monorepo_fail(tmp_path: Path, monkeypatch) ->
             return SimpleNamespace(returncode=1, stdout="1 failed")
         return SimpleNamespace(returncode=0, stdout="1 passed" if "pytest" in command else "")
 
-    monkeypatch.setattr(runner.subprocess, "run", fake_run)
+    monkeypatch.setattr(runner, "_run_command", fake_run)
     report = run_checks(tmp_path)
 
     assert report["status"] == "FAIL"
@@ -411,7 +488,7 @@ def test_tests_missing_from_parent_project_is_not_hidden_by_nested_package(tmp_p
     (tests_dir / "test_api.py").write_text("def test_ok(): assert True\n", encoding="utf-8")
 
     monkeypatch.setattr(
-        runner.subprocess, "run",
+        runner, "_run_command",
         lambda command, *, cwd, **kwargs: SimpleNamespace(
             returncode=0, stdout="1 passed" if "pytest" in command else ""
         ),
@@ -449,7 +526,7 @@ def test_parent_python_package_does_not_execute_nested_package_tests(tmp_path: P
             return SimpleNamespace(returncode=0, stdout="1 passed")
         return SimpleNamespace(returncode=0, stdout="")
 
-    monkeypatch.setattr(runner.subprocess, "run", fake_run)
+    monkeypatch.setattr(runner, "_run_command", fake_run)
     report = run_checks(tmp_path)
 
     assert report["status"] == "PASS", report
@@ -501,8 +578,8 @@ def test_csharp_exit_zero_without_fresh_trx_report_fails_closed(tmp_path: Path, 
     )
     monkeypatch.setattr(runner.shutil, "which", lambda executable: f"/fake/{executable}")
     monkeypatch.setattr(
-        runner.subprocess,
-        "run",
+        runner,
+        "_run_command",
         lambda command, **kwargs: SimpleNamespace(
             returncode=0,
             stdout="Passed! - Failed: 0, Passed: 1, Skipped: 0, Total: 1",
@@ -536,14 +613,14 @@ def test_csharp_all_skipped_trx_report_fails_closed(tmp_path: Path, monkeypatch)
         return SimpleNamespace(returncode=0, stdout="Build succeeded.")
 
     monkeypatch.setattr(runner.shutil, "which", lambda executable: f"/fake/{executable}")
-    monkeypatch.setattr(runner.subprocess, "run", fake_run)
+    monkeypatch.setattr(runner, "_run_command", fake_run)
     report = runner.run_checks(tmp_path)
     assert report["status"] == "FAIL"
     assert report["results"][0]["tests_passed"] == 0
     assert report["results"][0]["tests_skipped"] == 1
 
 
-def test_npm_workspace_runs_once_from_workspace_root(tmp_path: Path, monkeypatch) -> None:
+def test_javascript_workspace_runs_once_from_workspace_root(tmp_path: Path, monkeypatch) -> None:
     from types import SimpleNamespace
     import polyguard.runner as runner
 
@@ -577,7 +654,7 @@ def test_npm_workspace_runs_once_from_workspace_root(tmp_path: Path, monkeypatch
             stdout="# tests 1\n# pass 1\n# fail 0\n",
         )
 
-    monkeypatch.setattr(runner.subprocess, "run", fake_run)
+    monkeypatch.setattr(runner, "_run_command", fake_run)
     monkeypatch.setattr(runner.shutil, "which", lambda executable: f"/fake/{executable}")
     report = runner.run_checks(tmp_path)
 
@@ -585,7 +662,120 @@ def test_npm_workspace_runs_once_from_workspace_root(tmp_path: Path, monkeypatch
     assert len(report["results"]) == 1
     assert Path(report["results"][0]["project_root"]) == tmp_path
     assert len(calls) == 1
-    assert "--workspaces" in calls[0][0]
+    assert calls[0][0][:2] == ["node", "--test"]
+    assert calls[0][0][0] != "npm"
+
+
+def test_javascript_ignores_arbitrary_npm_test_script(tmp_path: Path, monkeypatch) -> None:
+    from types import SimpleNamespace
+    import polyguard.runner as runner
+
+    (tmp_path / "package.json").write_text(
+        json.dumps({"name": "fake-script", "scripts": {"test": "echo 'Tests 99 passed (99)'"}}),
+        encoding="utf-8",
+    )
+    tests_dir = tmp_path / "test"
+    tests_dir.mkdir()
+    (tests_dir / "math.test.js").write_text(
+        "const test = require('node:test'); test('works', () => {});\n",
+        encoding="utf-8",
+    )
+    calls = []
+
+    def fake_run(command, *, cwd, **kwargs):
+        calls.append(command)
+        return SimpleNamespace(returncode=0, stdout="# tests 1\n# pass 1\n# fail 0\n")
+
+    monkeypatch.setattr(runner, "_run_command", fake_run)
+    monkeypatch.setattr(runner.shutil, "which", lambda executable: f"/fake/{executable}")
+    report = runner.run_checks(tmp_path)
+
+    assert report["status"] == "PASS", report
+    assert calls == [["node", "--test"]]
+    assert report["results"][0]["tests_passed"] == 1
+
+
+def test_maven_does_not_hide_unlisted_nested_project(tmp_path: Path) -> None:
+    import polyguard.runner as runner
+
+    (tmp_path / "pom.xml").write_text(
+        "<project><modules><module>modules/api</module></modules></project>",
+        encoding="utf-8",
+    )
+    member = tmp_path / "modules" / "api"
+    member.mkdir(parents=True)
+    (member / "pom.xml").write_text("<project />", encoding="utf-8")
+    independent = tmp_path / "independent"
+    independent.mkdir()
+    (independent / "pom.xml").write_text("<project />", encoding="utf-8")
+
+    units = runner._discover_project_units(tmp_path)
+    java_roots = {unit.root for unit in units if unit.language == "java"}
+    assert tmp_path in java_roots
+    assert independent in java_roots
+    assert member not in java_roots
+
+
+def test_gradle_does_not_hide_unincluded_nested_project(tmp_path: Path) -> None:
+    import polyguard.runner as runner
+
+    (tmp_path / "settings.gradle").write_text('include(":api")\n', encoding="utf-8")
+    api = tmp_path / "api"
+    api.mkdir()
+    (api / "build.gradle").write_text("plugins { id 'java' }\n", encoding="utf-8")
+    independent = tmp_path / "independent"
+    independent.mkdir()
+    (independent / "build.gradle").write_text("plugins { id 'java' }\n", encoding="utf-8")
+
+    units = runner._discover_project_units(tmp_path)
+    java_roots = {unit.root for unit in units if unit.language == "java"}
+    assert tmp_path in java_roots
+    assert independent in java_roots
+    assert api not in java_roots
+
+
+def test_dotnet_does_not_hide_project_missing_from_solution(tmp_path: Path) -> None:
+    import polyguard.runner as runner
+
+    (tmp_path / "Workspace.sln").write_text(
+        'Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "Included", '
+        '"included\\Included.csproj", "{11111111-1111-1111-1111-111111111111}"\n'
+        'EndProject\n',
+        encoding="utf-8",
+    )
+    included = tmp_path / "included"
+    included.mkdir()
+    (included / "Included.csproj").write_text("<Project />", encoding="utf-8")
+    independent = tmp_path / "independent"
+    independent.mkdir()
+    (independent / "Independent.csproj").write_text("<Project />", encoding="utf-8")
+
+    units = runner._discover_project_units(tmp_path)
+    csharp_roots = {unit.root for unit in units if unit.language == "csharp"}
+    assert tmp_path in csharp_roots
+    assert independent in csharp_roots
+    assert included not in csharp_roots
+
+
+def test_config_test_patterns_cannot_match_nested_child_tests(tmp_path: Path) -> None:
+    (tmp_path / "pyproject.toml").write_text("[project]\nname='parent'\n", encoding="utf-8")
+    (tmp_path / "app.py").write_text("value = 1\n", encoding="utf-8")
+    child = tmp_path / "packages" / "api"
+    (child / "tests").mkdir(parents=True)
+    (child / "pyproject.toml").write_text("[project]\nname='child'\n", encoding="utf-8")
+    (child / "tests" / "test_api.py").write_text("def test_api(): assert True\n", encoding="utf-8")
+    config = tmp_path / ".polyguard.toml"
+    config.write_text(
+        "[checks.python]\n"
+        f"commands = [[{sys.executable!r}, '-c', 'print(1)']]\n"
+        "test_patterns = ['**/test_api.py']\n",
+        encoding="utf-8",
+    )
+
+    report = run_checks(tmp_path)
+    parent_result = next(item for item in report["results"] if Path(item["project_root"]) == tmp_path)
+    assert parent_result["status"] == "FAIL"
+    assert "did not match" in parent_result["reason"].lower()
 
 
 def test_cargo_workspace_runs_once_from_workspace_root(tmp_path: Path, monkeypatch) -> None:
@@ -615,7 +805,7 @@ def test_cargo_workspace_runs_once_from_workspace_root(tmp_path: Path, monkeypat
             stdout="test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out\n",
         )
 
-    monkeypatch.setattr(runner.subprocess, "run", fake_run)
+    monkeypatch.setattr(runner, "_run_command", fake_run)
     monkeypatch.setattr(runner.shutil, "which", lambda executable: f"/fake/{executable}")
     report = runner.run_checks(tmp_path)
 
@@ -652,7 +842,7 @@ def test_maven_modules_run_once_from_aggregator_root(tmp_path: Path, monkeypatch
         )
         return SimpleNamespace(returncode=0, stdout="")
 
-    monkeypatch.setattr(runner.subprocess, "run", fake_run)
+    monkeypatch.setattr(runner, "_run_command", fake_run)
     monkeypatch.setattr(runner.shutil, "which", lambda executable: f"/fake/{executable}")
     report = runner.run_checks(tmp_path)
 
@@ -668,8 +858,8 @@ def test_gradle_settings_aggregator_runs_once_at_root(tmp_path: Path, monkeypatc
     from types import SimpleNamespace
     import polyguard.runner as runner
 
-    (tmp_path / "settings.gradle").write_text('rootProject.name = "workspace"\ninclude(":api")\n', encoding="utf-8")
-    member = tmp_path / "api"
+    (tmp_path / "settings.gradle").write_text('rootProject.name = "workspace"\ninclude(\n    ":api"\n)\nproject(":api").projectDir = file("modules/api")\n', encoding="utf-8")
+    member = tmp_path / "modules" / "api"
     test_file = member / "src" / "test" / "java" / "ApiTest.java"
     test_file.parent.mkdir(parents=True)
     (member / "build.gradle").write_text("plugins { id 'java' }\n", encoding="utf-8")
@@ -687,7 +877,7 @@ def test_gradle_settings_aggregator_runs_once_at_root(tmp_path: Path, monkeypatc
         )
         return SimpleNamespace(returncode=0, stdout="")
 
-    monkeypatch.setattr(runner.subprocess, "run", fake_run)
+    monkeypatch.setattr(runner, "_run_command", fake_run)
     monkeypatch.setattr(runner.shutil, "which", lambda executable: f"/fake/{executable}")
     report = runner.run_checks(tmp_path)
 
@@ -703,7 +893,13 @@ def test_dotnet_solution_runs_child_projects_once(tmp_path: Path, monkeypatch) -
     from types import SimpleNamespace
     import polyguard.runner as runner
 
-    (tmp_path / "Workspace.sln").write_text("Microsoft Visual Studio Solution File\n", encoding="utf-8")
+    (tmp_path / "Workspace.sln").write_text(
+        'Microsoft Visual Studio Solution File\n'
+        'Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "Api.Tests", '
+        '"tests\\Api.Tests\\Api.Tests.csproj", "{11111111-1111-1111-1111-111111111111}"\n'
+        'EndProject\n',
+        encoding="utf-8",
+    )
     member = tmp_path / "tests" / "Api.Tests"
     member.mkdir(parents=True)
     (member / "Api.Tests.csproj").write_text("<Project />", encoding="utf-8")
@@ -721,7 +917,7 @@ def test_dotnet_solution_runs_child_projects_once(tmp_path: Path, monkeypatch) -
         )
         return SimpleNamespace(returncode=0, stdout="")
 
-    monkeypatch.setattr(runner.subprocess, "run", fake_run)
+    monkeypatch.setattr(runner, "_run_command", fake_run)
     monkeypatch.setattr(runner.shutil, "which", lambda executable: f"/fake/{executable}")
     report = runner.run_checks(tmp_path)
 
@@ -750,7 +946,7 @@ def test_java_native_report_must_be_created_during_current_run(tmp_path: Path, m
 
     monkeypatch.setattr(runner.shutil, "which", lambda executable: f"/fake/{executable}")
     monkeypatch.setattr(
-        runner.subprocess, "run",
+        runner, "_run_command",
         lambda command, **kwargs: SimpleNamespace(returncode=0, stdout="BUILD SUCCESS"),
     )
     report = runner.run_checks(tmp_path)
@@ -768,7 +964,8 @@ def test_junit_aggregate_counters_without_testcases_are_not_evidence(tmp_path: P
         '</testsuites>',
         encoding="utf-8",
     )
-    assert _parse_junit_xml(report) == (0, 0, 0)
+    with pytest.raises(ValueError, match="counter does not match testcase records"):
+        _parse_junit_xml(report)
 
 
 def test_files_for_unit_does_not_exclude_nested_different_language_project(tmp_path: Path) -> None:
@@ -855,7 +1052,7 @@ def test_mixed_c_cpp_cmake_invocation_runs_once(tmp_path: Path, monkeypatch) -> 
             return SimpleNamespace(returncode=0, stdout="100% tests passed, 0 tests failed out of 2\n")
         return SimpleNamespace(returncode=0, stdout="")
 
-    monkeypatch.setattr(runner.subprocess, "run", fake_run)
+    monkeypatch.setattr(runner, "_run_command", fake_run)
     monkeypatch.setattr(runner.shutil, "which", lambda executable: f"/fake/{executable}")
     report = runner.run_checks(tmp_path)
 
@@ -925,14 +1122,15 @@ def test_nested_native_report_projects_pass_from_their_own_root(
             )
         elif language == "php":
             (result_dir / "phpunit.xml").write_text(
-                '<testsuites><testsuite><testcase name="works"/></testsuite></testsuites>',
+                '<testsuites><testsuite tests="1" failures="0" errors="0" skipped="0">'
+                    '<testcase name="works"/></testsuite></testsuites>',
                 encoding="utf-8"
             )
         output = "Test run with 1 test in 1 suite passed." if language == "swift" else "Build succeeded."
         return SimpleNamespace(returncode=0, stdout=output)
 
     monkeypatch.setattr(runner.shutil, "which", lambda executable: f"/fake/{executable}")
-    monkeypatch.setattr(runner.subprocess, "run", fake_run)
+    monkeypatch.setattr(runner, "_run_command", fake_run)
     report = runner.run_checks(tmp_path)
 
     assert report["status"] == "PASS", report

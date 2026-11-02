@@ -40,7 +40,7 @@ polyguard verify --config ./ci/polyguard.toml
 polyguard --version
 \`\`\`
 
-Exit code is **0** for PASS and **1** for FAIL. Missing tests, missing toolchains, invalid configuration, a build/test failure, timeout, or missing positive test-execution evidence returns FAIL.
+Exit code is **0** for PASS and **1** for FAIL. Missing tests, missing toolchains, invalid configuration, a build/test failure, timeout, or missing positive test-execution evidence returns FAIL. On timeout, Polyguard terminates the command's process group/tree to avoid leaving test-runner descendants behind.
 
 ## Built-in language support
 
@@ -49,7 +49,7 @@ Exit code is **0** for PASS and **1** for FAIL. Missing tests, missing toolchain
 | Python | \`compileall\`, then \`pytest -q\` | Pytest passed-test summary |
 | Rust | \`cargo test --all-targets\` | Cargo test-result summary |
 | Go | \`go test -json ./...\` | Passing test events in JSON stream |
-| JavaScript / TypeScript | \`npm test\`; TypeScript also runs \`tsc --noEmit\` when configured | Recognized runner pass summary (including Vitest default/minimal, Jest, Mocha, and Node TAP formats) |
+| JavaScript / TypeScript | Direct Vitest/Jest/Mocha/TAP CLI when declared, otherwise `node --test`; TypeScript also runs `tsc --noEmit` when configured | Recognized runner pass summary (including Vitest default/minimal, Jest, Mocha, and Node TAP formats) |
 | Java | Maven `clean test` or Gradle `clean test` | Parsed Surefire/Gradle JUnit XML; at least one pass, zero failures |
 | C# | dotnet test with a Polyguard TRX prefix | Parsed TRX counters; at least one pass, zero failures |
 | PHP | PHPUnit with --log-junit | Parsed JUnit XML; at least one pass, zero failures |
@@ -58,7 +58,7 @@ Exit code is **0** for PASS and **1** for FAIL. Missing tests, missing toolchain
 | C | CMake build and CTest | CTest positive test count |
 | C++ | CMake build and CTest | CTest positive test count |
 
-C and C++ are separate language identifiers in configuration. JavaScript and TypeScript share the npm project plan; TypeScript type checking does not replace running tests.
+C and C++ are separate language identifiers in configuration. JavaScript and TypeScript share the same project plan; TypeScript type checking does not replace running tests. Project-defined npm `test` scripts are never treated as test-execution evidence.
 
 ### Monorepos and workspaces
 
@@ -69,7 +69,7 @@ Polyguard recursively discovers independent package roots and runs each package 
 - npm `workspaces`
 - .NET solution (`.sln`) files
 
-Each independently discovered project is reported separately. A failure or incomplete test report in any required project makes the overall result FAIL. For workspace aggregators, native package managers remain responsible for workspace dependency resolution and execution.
+Only projects explicitly declared as Maven modules, Gradle includes, Cargo members, npm workspace packages, or .NET solution projects are coalesced under the aggregator root. Unlisted nested projects remain independent units. Each independently discovered project is reported separately. A failure or incomplete test report in any required project makes the overall result FAIL. For workspace aggregators, native package managers remain responsible for workspace dependency resolution and execution.
 
 ## Configure custom test commands
 

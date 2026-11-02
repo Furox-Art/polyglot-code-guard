@@ -14,8 +14,8 @@ Use this skill whenever code is generated, changed, refactored, or described as 
 3. Run \`polyguard verify --path . --details\`.
 4. For a non-standard test runner, explicit commands and file patterns can be configured for diagnostics; custom commands cannot establish PASS until a trusted runner adapter is implemented.
 5. Run the complete configured test suite. Do not omit a detected or required language.
-6. Require a positive passed-test count in recognized runner output. Java and PHP default checks must produce fresh JUnit XML; C# must produce a fresh TRX report. Swift must emit a positive native test-runner summary. A successful command exit code alone is not sufficient.
-7. If a command fails, a toolchain is missing, tests cannot be found, the runner reports no passing tests, execution times out, or output evidence is missing, the verdict is FAIL.
+6. Require a positive passed-test count from the exact built-in command plan. Java and PHP default checks must produce fresh JUnit XML; C# must produce a fresh TRX report. Swift must emit a positive native test-runner summary. A successful command exit code alone is not sufficient.
+7. If a command fails, a toolchain is missing, tests cannot be found, the runner reports no passing tests, execution times out (the command process tree is terminated), or output evidence is missing, the verdict is FAIL.
 8. Fix the implementation or tests and rerun all checks. Never delete, skip, weaken, or rewrite a valid test merely to obtain PASS.
 9. Retain command output and the JSON report when inspectable evidence is requested.
 

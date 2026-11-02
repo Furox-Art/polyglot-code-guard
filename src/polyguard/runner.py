@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import time
@@ -141,7 +143,7 @@ def _project_files(root: Path) -> list[Path]:
         )
         current_path = Path(current)
         found.extend(current_path / name for name in filenames)
-    return sorted(found)
+    return sorted(path for path in found if _is_within(path.resolve(), root))
 
 
 def _in_test_tree(root: Path, path: Path) -> bool:
@@ -285,21 +287,34 @@ def _default_plans(root: Path, files: Iterable[Path] | None = None) -> dict[str,
         p.suffix.lower() in {".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx"} for p in files
     )
     if js_project:
-        package_file = root / "package.json"
-        try:
-            package_data = json.loads(_safe_read(package_file))
-        except (ValueError, TypeError):
-            package_data = {}
-        workspace_spec = package_data.get("workspaces", [])
-        workspace_patterns = (
-            workspace_spec.get("packages", []) if isinstance(workspace_spec, dict) else workspace_spec
-        )
-        is_workspace = isinstance(workspace_patterns, list) and bool(workspace_patterns)
-        if is_workspace:
-            test_command = ["npm", "test", "--workspaces", "--include-workspace-root", "--if-present"]
-        else:
-            test_command = ["npm", "test"]
-        js_commands = [test_command]
+        # Never delegate test execution to `npm test`: package.json scripts are
+        # arbitrary shell programs and can forge a passing summary. Invoke a
+        # recognized runner directly, or use Node's built-in test runner.
+        runner_dependencies: set[str] = set()
+        for package_file in (p for p in files if p.name.lower() == "package.json"):
+            try:
+                package_data = json.loads(_safe_read(package_file))
+            except (ValueError, TypeError):
+                continue
+            if not isinstance(package_data, dict):
+                continue
+            for section in ("dependencies", "devDependencies", "optionalDependencies"):
+                dependencies = package_data.get(section, {})
+                if isinstance(dependencies, dict):
+                    runner_dependencies.update(dependencies)
+        runner_commands = {
+            "vitest": ["npx", "--no-install", "vitest", "run"],
+            "jest": ["npx", "--no-install", "jest", "--runInBand"],
+            "mocha": ["npx", "--no-install", "mocha"],
+            "tap": ["npx", "--no-install", "tap"],
+        }
+        js_commands = [
+            runner_commands[name]
+            for name in ("vitest", "jest", "mocha", "tap")
+            if name in runner_dependencies
+        ]
+        if not js_commands:
+            js_commands = [["node", "--test"]]
         if "tsconfig.json" in names:
             js_commands.append(["npx", "--no-install", "tsc", "--noEmit"])
         plans["javascript"] = js_commands
@@ -460,8 +475,49 @@ def _npm_workspace_roots(root: Path, files: list[Path]) -> set[Path]:
     return workspace_roots
 
 
-def _is_below_any(path: Path, roots: set[Path]) -> bool:
-    return any(path != candidate and _is_within(path, candidate) for candidate in roots)
+def _gradle_member_roots(root: Path, files: list[Path]) -> set[Path]:
+    """Resolve only projects explicitly included by Gradle settings files."""
+    members: set[Path] = set()
+    for settings in (path for path in files if path.name.lower() in {"settings.gradle", "settings.gradle.kts"}):
+        content = _safe_read(settings)
+        project_dirs: dict[str, str] = {}
+        for match in re.finditer(
+            r"project\s*\(\s*['\"](:[^'\"]+)['\"]\s*\)\s*\.projectDir\s*=\s*file\s*\(\s*['\"]([^'\"]+)['\"]\s*\)",
+            content,
+        ):
+            project_dirs[match.group(1)] = match.group(2)
+        include_arguments = [
+            match.group(1)
+            for match in re.finditer(r"\binclude\s*\((.*?)\)", content, re.DOTALL)
+        ]
+        include_arguments.extend(
+            match.group(1)
+            for match in re.finditer(r"\binclude\s+([^\n]+)", content)
+        )
+        for arguments in include_arguments:
+            for project_path in re.findall(r"['\"](:[^'\"]+)['\"]", arguments):
+                relative = project_dirs.get(project_path, project_path.lstrip(":").replace(":", "/"))
+                candidate = (settings.parent / relative).resolve()
+                if _is_within(candidate, root.resolve()) and candidate.is_dir():
+                    members.add(candidate)
+    return members
+
+
+def _dotnet_solution_member_roots(root: Path, files: list[Path]) -> set[Path]:
+    """Resolve C# projects actually listed in a Visual Studio solution."""
+    members: set[Path] = set()
+    project_line = re.compile(
+        r'^Project\([^\r\n]*?\)\s*=\s*"[^"]+",\s*"([^"]+\.csproj)"',
+        re.IGNORECASE | re.MULTILINE,
+    )
+    for solution in (path for path in files if path.suffix.lower() == ".sln"):
+        content = _safe_read(solution)
+        for relative in project_line.findall(content):
+            candidate = (solution.parent / relative.replace("\\", "/")).resolve().parent
+            project_file = candidate / Path(relative.replace("\\", "/")).name
+            if _is_within(candidate, root.resolve()) and project_file.is_file():
+                members.add(candidate)
+    return members
 
 
 def _discover_project_units(
@@ -493,42 +549,20 @@ def _discover_project_units(
     maven_modules = _maven_module_roots(root, files)
     cargo_members = _cargo_workspace_member_roots(root, files)
     npm_workspaces = _npm_workspace_roots(root, files)
-    gradle_settings_roots = {
-        path.parent.resolve() for path in files
-        if path.name.lower() in {"settings.gradle", "settings.gradle.kts"}
-    }
-    solution_roots = {
-        path.parent.resolve() for path in files if path.suffix.lower() == ".sln"
-    }
+    gradle_members = _gradle_member_roots(root, files)
+    solution_members = _dotnet_solution_member_roots(root, files)
 
     units: set[ProjectUnit] = set()
     for language, project_roots in marker_roots.items():
         for project_root in project_roots:
             if language == "java":
-                if project_root in maven_modules:
+                if project_root in maven_modules or project_root in gradle_members:
                     continue
-                if project_root.name != "" and _is_below_any(project_root, maven_modules):
-                    continue
-                # A Gradle settings file defines one multi-project build. Nested
-                # build.gradle files are subprojects; nested settings files remain
-                # separate builds and are retained.
-                if _is_below_any(project_root, gradle_settings_roots):
-                    nearest_settings = max(
-                        (candidate for candidate in gradle_settings_roots if _is_within(project_root, candidate)),
-                        key=lambda candidate: len(candidate.parts),
-                        default=None,
-                    )
-                    if nearest_settings != project_root and nearest_settings is not None:
-                        continue
-            elif language == "rust" and (
-                project_root in cargo_members or _is_below_any(project_root, cargo_members)
-            ):
+            elif language == "rust" and project_root in cargo_members:
                 continue
-            elif language == "javascript" and (
-                project_root in npm_workspaces or _is_below_any(project_root, npm_workspaces)
-            ):
+            elif language == "javascript" and project_root in npm_workspaces:
                 continue
-            elif language == "csharp" and _is_below_any(project_root, solution_roots):
+            elif language == "csharp" and project_root in solution_members:
                 continue
 
             if language in {"c", "cpp"}:
@@ -585,6 +619,7 @@ def _files_for_unit(
     return [
         path for path in files
         if _is_within(path, unit.root)
+        and _is_within(path.resolve(), unit.root.resolve())
         and not any(_is_within(path, nested) for nested in nested_roots)
     ]
 
@@ -701,7 +736,9 @@ def _execution_evidence(
                 event = json.loads(line)
             except (json.JSONDecodeError, TypeError):
                 continue
-            if event.get("Action") == "pass" and event.get("Test"):
+            if not isinstance(event, dict):
+                return None, "go test JSON event must be an object."
+            if event.get("Action") == "pass" and isinstance(event.get("Test"), str) and event.get("Test"):
                 passed += 1
         if passed:
             return passed, f"go test JSON: {passed} passing test event(s)"
@@ -745,7 +782,28 @@ def _parse_junit_xml(path: Path) -> tuple[int, int, int]:
     accepted because they can describe an empty, stale, or skip-only suite.
     """
     root = ET.parse(path).getroot()
-    cases = [node for node in root.iter() if _xml_local_name(node.tag) == "testcase"]
+    root_name = _xml_local_name(root.tag)
+    if root_name not in {"testsuite", "testsuites"}:
+        raise ValueError(f"Unexpected JUnit root element: {root_name}.")
+    suites = [root] if root_name == "testsuite" else [
+        node for node in list(root) if _xml_local_name(node.tag) == "testsuite"
+    ]
+    if not suites:
+        raise ValueError("JUnit report contains no testsuite elements.")
+    cases = []
+    for suite in suites:
+        counters = {}
+        for key in ("tests", "failures", "errors", "skipped"):
+            raw = suite.attrib.get(key)
+            if raw is None or not raw.isdigit():
+                raise ValueError(f"JUnit testsuite has an invalid {key} counter.")
+            counters[key] = int(raw)
+        suite_cases = [
+            node for node in suite.iter() if _xml_local_name(node.tag) == "testcase"
+        ]
+        if counters["tests"] != len(suite_cases):
+            raise ValueError("JUnit testsuite test counter does not match testcase records.")
+        cases.extend(suite_cases)
     tests = len(cases)
     failures = skipped = 0
     for case in cases:
@@ -760,13 +818,20 @@ def _parse_junit_xml(path: Path) -> tuple[int, int, int]:
 def _parse_trx(path: Path) -> tuple[int, int, int]:
     """Return (tests, failures+errors, skipped) from a VSTest TRX file."""
     root = ET.parse(path).getroot()
+    if _xml_local_name(root.tag) != "testrun":
+        raise ValueError("TRX root element must be TestRun.")
     counters = next(
-        (node for node in root.iter() if _xml_local_name(node.tag) == "counters"),
+        (
+            node for summary in list(root)
+            if _xml_local_name(summary.tag) == "resultsummary"
+            for node in list(summary) if _xml_local_name(node.tag) == "counters"
+        ),
         None,
     )
     if counters is None:
         raise ValueError("TRX report has no ResultSummary/Counters element.")
     attrs = {key.lower(): value for key, value in counters.attrib.items()}
+    if not attrs.get("total", "").isdigit(): raise ValueError("TRX total counter is invalid.")
     total = _as_nonnegative_int(attrs.get("total"))
     passed = _as_nonnegative_int(attrs.get("passed"))
     failed = sum(
@@ -901,6 +966,66 @@ def _native_report_evidence(
     return passed, failed, skipped, total, evidence
 
 
+def _terminate_process_tree(process: subprocess.Popen[str]) -> None:
+    """Terminate the command and descendants created inside its process group/tree."""
+    if os.name == "posix":
+        try:
+            # _run_command starts each POSIX command in a fresh session, so the
+            # process PID is also the process-group ID. Kill the group even when
+            # its leader exited but a child still holds an inherited output pipe.
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        except OSError:
+            if process.poll() is None:
+                process.kill()
+        return
+
+    if os.name == "nt":
+        try:
+            subprocess.run(
+                ["taskkill", "/PID", str(process.pid), "/T", "/F"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=10,
+                check=False,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+    if process.poll() is None:
+        process.kill()
+
+
+def _run_command(
+    command: list[str],
+    *,
+    cwd: Path,
+    timeout: int,
+) -> subprocess.CompletedProcess[str]:
+    """Run one command, cleaning up its process tree when the timeout expires."""
+    process = subprocess.Popen(
+        command,
+        cwd=cwd,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        shell=False,
+        start_new_session=(os.name == "posix"),
+    )
+    try:
+        output, _ = process.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired as exc:
+        _terminate_process_tree(process)
+        output, _ = process.communicate()
+        raise subprocess.TimeoutExpired(
+            command,
+            timeout,
+            output=output if output is not None else exc.output,
+        ) from exc
+    return subprocess.CompletedProcess(command, process.returncode, output)
+
+
 def _failure_report(reason: str, language: str = "configuration") -> dict:
     result = CheckResult(language, "FAIL", [], 2, 0.0, reason)
     return {"status": "FAIL", "results": [asdict(result)]}
@@ -947,7 +1072,7 @@ def run_checks(
         project_root = str(unit.root)
 
         if language_config:
-            has_tests = _matching_config_tests(unit.root, language_config.test_patterns)
+            has_tests = _matching_config_tests(unit.root, language_config.test_patterns, unit_files)
             test_reason = "Configured test_patterns did not match any files."
         else:
             has_tests = _has_test(unit_files, language, unit.root)
@@ -1009,16 +1134,7 @@ def run_checks(
                 break
 
             try:
-                completed = subprocess.run(
-                    command,
-                    cwd=unit.root,
-                    text=True,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.STDOUT,
-                    timeout=timeout,
-                    check=False,
-                    shell=False,
-                )
+                completed = _run_command(command, cwd=unit.root, timeout=timeout)
                 last_code = completed.returncode
                 if completed.stdout:
                     output_parts.append(completed.stdout[-12000:])
