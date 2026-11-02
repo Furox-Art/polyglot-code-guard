@@ -283,7 +283,7 @@ def _default_plans(root: Path, files: Iterable[Path] | None = None) -> dict[str,
             cargo_data = tomllib.loads(_safe_read(cargo_manifest)) if cargo_manifest.exists() else {}
         except (ValueError, TypeError):
             cargo_data = {}
-        workspace = cargo_data.get("workspace", {})
+        workspace = cargo_data.get("workspace")
         if isinstance(workspace, dict):
             plans["rust"] = [["cargo", "test", "--workspace", "--all-targets"]]
         else:
@@ -419,7 +419,7 @@ def _maven_module_roots(root: Path, files: list[Path]) -> set[Path]:
         except (ET.ParseError, OSError):
             continue
         for node in document.iter():
-            if _xml_local_name(node.tag) != "module" or not node.text:
+            if _xml_local_name(node.tag) != "module" or not node.text or not node.text.strip():
                 continue
             candidate = (pom.parent / node.text.strip()).resolve()
             if _is_within(candidate, root.resolve()) and candidate.is_dir():

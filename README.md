@@ -135,9 +135,12 @@ Automatic language discovery is conservative. Custom frameworks can be configure
 
 ## Development
 
+The CI unit-test gate requires **100% line and branch coverage** of Polyguard's own Python implementation. This measures Polyguard's code, not the test coverage of projects it verifies.
+
 \`\`\`bash
 python -m pip install -e ".[test]"
 python -m pytest -q
+python -m pytest -q --cov=polyguard --cov-branch --cov-report=term-missing --cov-fail-under=100
 python -m build
 python -m twine check dist/*
 \`\`\`
