@@ -1,7 +1,7 @@
 """Real compiler/test-runner integration checks.
 
 Each test builds a disposable project and executes Polyguard against it.
-Missing local toolchains are skipped; CI installs each toolchain explicitly.
+Every required toolchain must be installed; a missing toolchain is a test failure.
 """
 
 from __future__ import annotations
@@ -22,21 +22,33 @@ def _write(root: Path, relative: str, content: str) -> None:
     target.write_text(content, encoding="utf-8")
 
 
-def _toolchain_available(language: str) -> bool:
-    requirements = {
-        "python": ["python3"],
-        "rust": ["cargo", "rustc"],
-        "javascript": ["node", "npm"],
-        "go": ["go"],
-        "c": ["cmake", "cc"],
-        "cpp": ["cmake", "c++"],
-        "ruby": ["ruby"],
-        "java": ["java", "javac", "mvn"],
-        "csharp": ["dotnet"],
-        "php": ["php", "composer"],
-        "swift": ["swift"],
-    }
-    return all(shutil.which(tool) for tool in requirements[language])
+TOOLCHAIN_REQUIREMENTS = {
+    "python": ["python3"],
+    "rust": ["cargo", "rustc"],
+    "javascript": ["node", "npm"],
+    "go": ["go"],
+    "c": ["cmake", "cc"],
+    "cpp": ["cmake", "c++"],
+    "ruby": ["ruby"],
+    "java": ["java", "javac", "mvn"],
+    "csharp": ["dotnet"],
+    "php": ["php", "composer"],
+    "swift": ["swift"],
+}
+
+
+def _missing_toolchains(languages: list[str]) -> list[str]:
+    required = sorted({tool for language in languages for tool in TOOLCHAIN_REQUIREMENTS[language]})
+    return [tool for tool in required if shutil.which(tool) is None]
+
+
+def _require_toolchains(languages: list[str]) -> None:
+    missing = _missing_toolchains(languages)
+    assert not missing, (
+        "Required integration-test toolchains are missing: "
+        + ", ".join(missing)
+        + ". Install the toolchains; tests must not be skipped."
+    )
 
 
 def _make_project(root: Path, language: str, failing: bool = False) -> None:
@@ -185,23 +197,42 @@ let package = Package(
 LANGUAGES = ["python", "rust", "javascript", "go", "c", "cpp", "ruby", "java", "csharp", "php", "swift"]
 
 
-def _prepare_external_fixture_dependencies(root: Path, language: str) -> None:
+@pytest.fixture(scope="session")
+def php_fixture_dependencies(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    """Install PHPUnit once and reuse the locked vendor tree for both PHP fixtures."""
+    template = tmp_path_factory.mktemp("polyguard-php-fixture-dependencies")
+    _write(
+        template,
+        "composer.json",
+        '{"name":"polyguard/fixture","require-dev":{"phpunit/phpunit":"^12.0"}}\n',
+    )
+    completed = subprocess.run(
+        ["composer", "install", "--no-interaction", "--prefer-dist", "--no-progress"],
+        cwd=template, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        timeout=240, check=False,
+    )
+    if completed.returncode:
+        pytest.fail(f"Composer fixture setup failed:\n{completed.stdout}")
+    assert (template / "composer.lock").is_file(), "Composer did not create composer.lock."
+    assert (template / "vendor" / "bin" / "phpunit").is_file(), "Composer did not install PHPUnit."
+    return template
+
+
+def _prepare_external_fixture_dependencies(
+    root: Path, language: str, php_template: Path | None = None,
+) -> None:
     if language == "php":
-        completed = subprocess.run(
-            ["composer", "install", "--no-interaction", "--prefer-dist", "--no-progress"],
-            cwd=root, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-            timeout=240, check=False,
-        )
-        if completed.returncode:
-            pytest.fail(f"Composer fixture setup failed:\n{completed.stdout}")
+        assert php_template is not None, "PHP fixture dependencies must be prepared once per test session."
+        shutil.copy2(php_template / "composer.lock", root / "composer.lock")
+        shutil.copytree(php_template / "vendor", root / "vendor")
 
 
 @pytest.mark.parametrize("language", LANGUAGES)
-def test_real_toolchain_fixture_passes(tmp_path: Path, language: str) -> None:
-    if not _toolchain_available(language):
-        pytest.skip(f"Required local toolchain for {language} is not installed.")
+def test_real_toolchain_fixture_passes(tmp_path: Path, language: str, request: pytest.FixtureRequest) -> None:
+    _require_toolchains([language])
     _make_project(tmp_path, language)
-    _prepare_external_fixture_dependencies(tmp_path, language)
+    php_template = request.getfixturevalue("php_fixture_dependencies") if language == "php" else None
+    _prepare_external_fixture_dependencies(tmp_path, language, php_template)
     report = run_checks(tmp_path, timeout=240)
     assert report["status"] == "PASS", json.dumps(report, indent=2)
     assert len(report["results"]) == 1
@@ -210,11 +241,11 @@ def test_real_toolchain_fixture_passes(tmp_path: Path, language: str) -> None:
 
 
 @pytest.mark.parametrize("language", LANGUAGES)
-def test_real_toolchain_fixture_fails_on_assertion(tmp_path: Path, language: str) -> None:
-    if not _toolchain_available(language):
-        pytest.skip(f"Required local toolchain for {language} is not installed.")
+def test_real_toolchain_fixture_fails_on_assertion(tmp_path: Path, language: str, request: pytest.FixtureRequest) -> None:
+    _require_toolchains([language])
     _make_project(tmp_path, language, failing=True)
-    _prepare_external_fixture_dependencies(tmp_path, language)
+    php_template = request.getfixturevalue("php_fixture_dependencies") if language == "php" else None
+    _prepare_external_fixture_dependencies(tmp_path, language, php_template)
     report = run_checks(tmp_path, timeout=240)
     assert report["status"] == "FAIL", json.dumps(report, indent=2)
     result = report["results"][0]
@@ -234,9 +265,7 @@ def test_repository_fixture_directory_is_not_misdetected(tmp_path: Path) -> None
 
 def test_real_python_go_rust_monorepo_fixtures(tmp_path: Path) -> None:
     languages = ["python", "go", "rust"]
-    missing = [language for language in languages if not _toolchain_available(language)]
-    if missing:
-        pytest.skip(f"Required local toolchains are not installed: {', '.join(missing)}")
+    _require_toolchains(languages)
 
     for language, directory in zip(languages, ["apps/api", "services/worker", "libs/core"]):
         package_root = tmp_path / directory
@@ -256,9 +285,7 @@ def test_real_python_go_rust_monorepo_fixtures(tmp_path: Path) -> None:
 
 def test_real_python_rust_monorepo_fixtures(tmp_path: Path) -> None:
     languages = ["python", "rust"]
-    missing = [language for language in languages if not _toolchain_available(language)]
-    if missing:
-        pytest.skip(f"Required local toolchains are not installed: {', '.join(missing)}")
+    _require_toolchains(languages)
 
     for language, directory in zip(languages, ["apps/api", "libs/core"]):
         package_root = tmp_path / directory

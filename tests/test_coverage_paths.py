@@ -42,16 +42,15 @@ def test_in_test_tree_handles_paths_outside_root_and_unreadable_files(tmp_path):
     assert runner._safe_read(missing) == ""
 
 
-def test_project_files_ignores_symlink_loops_and_ignored_directories(tmp_path):
+def test_project_files_ignores_symlink_loops_and_ignored_directories(tmp_path, monkeypatch):
     (tmp_path / "src").mkdir()
     (tmp_path / "src" / "main.py").write_text("x = 1", encoding="utf-8")
     (tmp_path / "node_modules").mkdir()
     (tmp_path / "node_modules" / "ignored.js").write_text("x", encoding="utf-8")
     loop = tmp_path / "loop.py"
-    try:
-        loop.symlink_to(loop)
-    except OSError:
-        pytest.skip("Symlinks are unavailable on this filesystem.")
+    loop.write_text("symlink placeholder", encoding="utf-8")
+    original_is_symlink = Path.is_symlink
+    monkeypatch.setattr(Path, "is_symlink", lambda path: path == loop or original_is_symlink(path))
     found = runner._project_files(tmp_path)
     assert tmp_path / "src" / "main.py" in found
     assert tmp_path / "node_modules" / "ignored.js" not in found
@@ -377,32 +376,27 @@ def test_prepare_result_area_cleans_only_owned_reports_and_ignores_other_languag
     runner._prepare_result_area(tmp_path, "csharp")
 
 
-def test_prepare_result_area_rejects_non_directory_and_symlink(tmp_path):
+def test_prepare_result_area_rejects_non_directory_and_symlink(tmp_path, monkeypatch):
     file_path = tmp_path / ".polyguard-results"
     file_path.write_text("file", encoding="utf-8")
     with pytest.raises(OSError, match="not a directory"):
         runner._prepare_result_area(tmp_path, "php")
     file_path.unlink()
-    target = tmp_path / "target"
-    target.mkdir()
-    try:
-        file_path.symlink_to(target, target_is_directory=True)
-    except OSError:
-        pytest.skip("Symlinks are unavailable on this filesystem.")
+    original_is_symlink = Path.is_symlink
+    monkeypatch.setattr(Path, "is_symlink", lambda path: path == file_path or original_is_symlink(path))
     with pytest.raises(OSError, match="symlink"):
         runner._prepare_result_area(tmp_path, "php")
 
 
-def test_prepare_result_area_refuses_stale_symlink_report(tmp_path):
+def test_prepare_result_area_refuses_stale_symlink_report(tmp_path, monkeypatch):
     runner._prepare_result_area(tmp_path, "csharp")
     results = tmp_path / ".polyguard-results"
     target = tmp_path / "outside.trx"
     target.write_text("keep", encoding="utf-8")
     link = results / "polyguard-old.trx"
-    try:
-        link.symlink_to(target)
-    except OSError:
-        pytest.skip("Symlinks are unavailable on this filesystem.")
+    link.write_text("symlink placeholder", encoding="utf-8")
+    original_is_symlink = Path.is_symlink
+    monkeypatch.setattr(Path, "is_symlink", lambda path: path == link or original_is_symlink(path))
     with pytest.raises(OSError, match="non-regular"):
         runner._prepare_result_area(tmp_path, "csharp")
     assert target.exists()
@@ -461,18 +455,23 @@ def test_cargo_and_npm_workspace_glob_errors_are_skipped(tmp_path, monkeypatch):
     assert runner._npm_workspace_roots(tmp_path, [package]) == set()
 
 
-def test_cargo_and_npm_workspaces_reject_symlink_members_outside_root(tmp_path):
+def test_cargo_and_npm_workspaces_reject_symlink_members_outside_root(tmp_path, monkeypatch):
     external = tmp_path.parent / (tmp_path.name + "-external")
     external.mkdir()
     (external / "Cargo.toml").write_text("[package]\nname='external'\n", encoding="utf-8")
     (external / "package.json").write_text("{}", encoding="utf-8")
     cargo_member = tmp_path / "cargo-member"
     npm_member = tmp_path / "npm-member"
-    try:
-        cargo_member.symlink_to(external, target_is_directory=True)
-        npm_member.symlink_to(external, target_is_directory=True)
-    except OSError:
-        pytest.skip("Symlinks are unavailable on this filesystem.")
+    cargo_member.mkdir()
+    npm_member.mkdir()
+    original_resolve = Path.resolve
+
+    def resolve_external_members(path, *args, **kwargs):
+        if path in {cargo_member, npm_member}:
+            return external
+        return original_resolve(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "resolve", resolve_external_members)
     cargo = tmp_path / "Cargo.toml"
     cargo.write_text("[workspace]\nmembers=['cargo-member']\n", encoding="utf-8")
     package = tmp_path / "package.json"
@@ -507,10 +506,9 @@ def test_native_report_evidence_rejects_stale_symlink_nested_and_outside_reports
     nested_report = nested_dir / "TEST-nested.xml"
     nested_report.write_text(valid.read_text(encoding="utf-8"), encoding="utf-8")
     symlink = report_dir / "TEST-link.xml"
-    try:
-        symlink.symlink_to(external_report)
-    except OSError:
-        pytest.skip("Symlinks are unavailable on this filesystem.")
+    symlink.write_text("symlink placeholder", encoding="utf-8")
+    original_is_symlink = Path.is_symlink
+    monkeypatch.setattr(Path, "is_symlink", lambda path: path == symlink or original_is_symlink(path))
     unit = runner.ProjectUnit(tmp_path, "java")
     nested_unit = runner.ProjectUnit(tmp_path / "nested", "java")
     monkeypatch.setattr(runner, "_native_report_paths", lambda language, root: [
