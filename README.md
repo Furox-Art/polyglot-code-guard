@@ -54,7 +54,7 @@ Exit code is **0** for PASS and **1** for FAIL. Missing tests, missing toolchain
 | C# | dotnet test with a Polyguard TRX prefix | Parsed TRX counters; at least one pass, zero failures |
 | PHP | PHPUnit with --log-junit | Parsed JUnit XML; at least one pass, zero failures |
 | Ruby | RSpec, or Ruby's Minitest runner | RSpec/Minitest success summary |
-| Swift | swift test --parallel with xUnit output | Parsed SwiftPM xUnit XML; at least one pass, zero failures |
+| Swift | `swift test --parallel` | Recognized Swift Testing/XCTest runner summary with a positive passed-test count |
 | C | CMake build and CTest | CTest positive test count |
 | C++ | CMake build and CTest | CTest positive test count |
 
@@ -91,7 +91,7 @@ Configuration fields:
 - \`commands\`: non-empty argument arrays. Commands are launched without a shell.
 - \`test_patterns\`: at least one matching file must exist inside the project root.
 
-**Evidence boundary:** custom \`success_patterns\` are rejected. An arbitrary output regex can be satisfied by a dummy command and cannot establish that tests executed. Custom commands must emit a recognized built-in runner summary. Java, C#, PHP, and Swift additionally require a fresh structured report generated during the current run. Unsupported custom output formats fail closed; they cannot be promoted to PASS with a user-supplied regex.
+**Evidence boundary:** custom \`success_patterns\` are rejected. An arbitrary output regex can be satisfied by a dummy command and cannot establish that tests executed. Custom commands must emit a recognized built-in runner summary. Java and PHP additionally require fresh JUnit XML reports; C# requires a fresh TRX report generated during the current run. Swift uses its native test-runner summary. Unsupported custom output formats fail closed; they cannot be promoted to PASS with a user-supplied regex.
 
 ## Test evidence and verdict rules
 
@@ -101,11 +101,11 @@ A language check returns PASS only when:
 3. A built-in runner summary or a freshly generated native structured test report proves that at least one test passed.
 4. No command failure or timeout occurs.
 
-A zero-test run, an all-skipped suite, an output with no recognized success summary, inconsistent report counters, a malformed or stale native report, or a non-zero exit code returns FAIL. Java and PHP require freshly generated JUnit XML; Swift requires a fresh SwiftPM xUnit XML report from an XCTest-compatible run; C# requires a fresh TRX report. A successful command exit alone is insufficient. C# currently targets the VSTest TRX logger contract; Microsoft.Testing.Platform projects that do not emit this TRX report fail closed until an MTP-specific adapter is configured. SwiftPM's xUnit report path is validated with XCTest; Swift Testing-only projects that do not emit a report fail closed rather than receiving a console-based PASS. JSON and detailed output include passed, failed, skipped, and total counts when the runner report exposes them.
+A zero-test run, an all-skipped suite, an output with no recognized success summary, inconsistent report counters, a malformed or stale native report, or a non-zero exit code returns FAIL. Java and PHP require freshly generated JUnit XML; C# requires a fresh TRX report. Swift uses a positive test count from the SwiftPM runner summary because Swift Testing does not produce a usable xUnit report in this workflow. A successful command exit alone is insufficient. C# currently targets the VSTest TRX logger contract; Microsoft.Testing.Platform projects that do not emit this TRX report fail closed until an MTP-specific adapter is configured. JSON and detailed output include passed, failed, skipped, and total counts when the runner report exposes them.
 
 ## Integration tests
 
-The repository includes disposable real-project fixtures for all eleven supported language identifiers, including real Java/JUnit, C#/.NET, PHP/PHPUnit, and SwiftPM/XCTest projects. The suite also covers mixed-language and native-workspace monorepos. Run:
+The repository includes disposable real-project fixtures for all eleven supported language identifiers, including real Java/JUnit, C#/.NET, PHP/PHPUnit, and SwiftPM/Swift Testing projects. The suite also covers mixed-language and native-workspace monorepos. Run:
 
 \`\`\`bash
 python -m pip install -e ".[test]"

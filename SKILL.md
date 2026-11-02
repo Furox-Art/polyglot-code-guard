@@ -14,7 +14,7 @@ Use this skill whenever code is generated, changed, refactored, or described as 
 3. Run \`polyguard verify --path . --details\`.
 4. For a non-standard test runner, configure explicit commands, file patterns, and a success-summary parser in \`.polyguard.toml\`.
 5. Run the complete configured test suite. Do not omit a detected or required language.
-6. Require a positive passed-test count in recognized runner output. Java, C#, PHP, and Swift default checks must produce a fresh, valid JUnit XML or TRX report with at least one pass and zero failures; a successful command exit code alone is not sufficient.
+6. Require a positive passed-test count in recognized runner output. Java and PHP default checks must produce fresh JUnit XML; C# must produce a fresh TRX report. Swift must emit a positive native test-runner summary. A successful command exit code alone is not sufficient.
 7. If a command fails, a toolchain is missing, tests cannot be found, the runner reports no passing tests, execution times out, or output evidence is missing, the verdict is FAIL.
 8. Fix the implementation or tests and rerun all checks. Never delete, skip, weaken, or rewrite a valid test merely to obtain PASS.
 9. Retain command output and the JSON report when inspectable evidence is requested.
@@ -28,7 +28,7 @@ The CLI exits 0 only for PASS and 1 for FAIL. Default output is exactly one word
 
 ## Custom command trust
 
-Custom \`success_patterns\` are rejected because arbitrary output regexes can manufacture a false PASS. Custom commands must emit a recognized built-in runner summary; Java, C#, PHP, and Swift additionally require a fresh native test report.
+Custom \`success_patterns\` are rejected because arbitrary output regexes can manufacture a false PASS. Custom commands may emit recognized runner-summary text, but that text is not cryptographic proof of execution and can be spoofed by the command itself. Treat custom command configuration as trusted project input. Java, C#, and PHP additionally require fresh native reports; Swift uses its runner summary.
 
 ## Scope
 
