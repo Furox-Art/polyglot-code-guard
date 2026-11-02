@@ -42,15 +42,15 @@ def _toolchain_available(language: str) -> bool:
 def _make_project(root: Path, language: str, failing: bool = False) -> None:
     if language == "python":
         _write(root, "app.py", "def add(a, b): return a + b\n")
-        assertion = "assert add(2, 3) == 99" if failing else "assert add(2, 3) == 5"
+        assertion = "assert add(2, 3) == 99, 'POLYGUARD_EXPECTED_ASSERTION_FAILURE'" if failing else "assert add(2, 3) == 5"
         _write(root, "tests/test_app.py", f"from app import add\ndef test_add(): {assertion}\n")
     elif language == "rust":
         _write(root, "Cargo.toml", '[package]\nname = "polyguard_fixture"\nversion = "0.1.0"\nedition = "2021"\n')
-        assertion = "assert_eq!(2 + 3, 99);" if failing else "assert_eq!(2 + 3, 5);"
+        assertion = 'assert_eq!(2 + 3, 99, "POLYGUARD_EXPECTED_ASSERTION_FAILURE");' if failing else "assert_eq!(2 + 3, 5);"
         _write(root, "src/lib.rs", f"#[cfg(test)] mod tests {{ #[test] fn addition_works() {{ {assertion} }} }}\n")
     elif language == "javascript":
         _write(root, "package.json", '{"name":"polyguard-fixture","version":"1.0.0","scripts":{"test":"node --test"}}\n')
-        assertion = "assert.equal(2 + 3, 99);" if failing else "assert.equal(2 + 3, 5);"
+        assertion = 'assert.equal(2 + 3, 99, "POLYGUARD_EXPECTED_ASSERTION_FAILURE");' if failing else "assert.equal(2 + 3, 5);"
         _write(
             root, "test/math.test.js",
             "const test = require('node:test');\n"
@@ -61,10 +61,11 @@ def _make_project(root: Path, language: str, failing: bool = False) -> None:
         _write(root, "go.mod", "module example.com/polyguard-fixture\ngo 1.22\n")
         _write(root, "main.go", "package main\nfunc Add(a, b int) int { return a + b }\n")
         assertion = "99" if failing else "5"
+        failure_message = "POLYGUARD_EXPECTED_ASSERTION_FAILURE" if failing else "unexpected sum"
         _write(
             root, "main_test.go",
             'package main\nimport "testing"\n'
-            f'func TestAdd(t *testing.T) {{ if Add(2, 3) != {assertion} {{ t.Fatal("unexpected sum") }} }}\n',
+            f'func TestAdd(t *testing.T) {{ if Add(2, 3) != {assertion} {{ t.Fatal("{failure_message}") }} }}\n',
         )
     elif language == "c":
         _write(root, "CMakeLists.txt",
@@ -74,8 +75,10 @@ def _make_project(root: Path, language: str, failing: bool = False) -> None:
             "add_executable(test_math tests/test_math.c)\n"
             "add_test(NAME c_math COMMAND test_math)\n",
         )
-        assertion = "assert(2 + 3 == 99);" if failing else "assert(2 + 3 == 5);"
-        _write(root, "tests/test_math.c", f"#include <assert.h>\nint main(void) {{ {assertion} return 0; }}\n")
+        expected = 99 if failing else 5
+        failure_signal = 'fprintf(stderr, "POLYGUARD_EXPECTED_ASSERTION_FAILURE\\n"); ' if failing else ""
+        assertion = f"{failure_signal}assert(2 + 3 == {expected});"
+        _write(root, "tests/test_math.c", f"#include <assert.h>\n#include <stdio.h>\nint main(void) {{ {assertion} return 0; }}\n")
     elif language == "cpp":
         _write(root, "CMakeLists.txt",
             "cmake_minimum_required(VERSION 3.16)\n"
@@ -84,11 +87,13 @@ def _make_project(root: Path, language: str, failing: bool = False) -> None:
             "add_executable(test_math tests/test_math.cpp)\n"
             "add_test(NAME cpp_math COMMAND test_math)\n",
         )
-        assertion = "assert(2 + 3 == 99);" if failing else "assert(2 + 3 == 5);"
-        _write(root, "tests/test_math.cpp", f"#include <cassert>\nint main() {{ {assertion} return 0; }}\n")
+        expected = 99 if failing else 5
+        failure_signal = 'std::cerr << "POLYGUARD_EXPECTED_ASSERTION_FAILURE" << std::endl; ' if failing else ""
+        assertion = f"{failure_signal}assert(2 + 3 == {expected});"
+        _write(root, "tests/test_math.cpp", f"#include <cassert>\n#include <iostream>\nint main() {{ {assertion} return 0; }}\n")
     elif language == "ruby":
         _write(root, "Gemfile", 'source "https://rubygems.org"\n')
-        assertion = "assert_equal 99, 2 + 3" if failing else "assert_equal 5, 2 + 3"
+        assertion = 'assert_equal 99, 2 + 3, "POLYGUARD_EXPECTED_ASSERTION_FAILURE"' if failing else "assert_equal 5, 2 + 3"
         _write(
             root, "test/test_math_test.rb",
             "require 'minitest/autorun'\n"
@@ -115,7 +120,7 @@ def _make_project(root: Path, language: str, failing: bool = False) -> None:
         _write(
             root, "src/test/java/org/polyguard/MathTest.java",
             "package org.polyguard; import org.junit.jupiter.api.Test; import static org.junit.jupiter.api.Assertions.assertEquals; "
-            f"public class MathTest {{ @Test void additionWorks() {{ assertEquals({expected}, Math.add(2, 3)); }} }}\n",
+            f'public class MathTest {{ @Test void additionWorks() {{ assertEquals({expected}, Math.add(2, 3), "POLYGUARD_EXPECTED_ASSERTION_FAILURE"); }} }}\n',
         )
     elif language == "csharp":
         _write(
@@ -132,7 +137,7 @@ def _make_project(root: Path, language: str, failing: bool = False) -> None:
         )
         expected = 99 if failing else 5
         _write(root, "MathTests.cs",
-               f"using Xunit; public class MathTests {{ [Fact] public void AdditionWorks() {{ Assert.Equal({expected}, 2 + 3); }} }}\n")
+               f'using Xunit; public class MathTests {{ [Fact] public void AdditionWorks() {{ Assert.True(2 + 3 == {expected}, "POLYGUARD_EXPECTED_ASSERTION_FAILURE"); }} }}\n')
     elif language == "php":
         _write(root, "composer.json",
                '{"name":"polyguard/fixture","require-dev":{"phpunit/phpunit":"^12.0"}}\n')
@@ -143,7 +148,7 @@ def _make_project(root: Path, language: str, failing: bool = False) -> None:
             root, "tests/MathTest.php",
             "<?php require_once __DIR__ . '/../src/Math.php'; "
             f"final class MathTest extends \\PHPUnit\\Framework\\TestCase {{ public function testAddition(): void {{ "
-            f"self::assertSame({expected}, \\Polyguard\\Math::add(2, 3)); }} }}\n",
+            f"self::assertSame({expected}, \\Polyguard\\Math::add(2, 3), 'POLYGUARD_EXPECTED_ASSERTION_FAILURE'); }} }}\n",
         )
     elif language == "swift":
         _write(
@@ -169,7 +174,7 @@ let package = Package(
 @testable import PolyguardFixture
 
 @Test func additionWorks() {{
-    #expect(Math.add(2, 3) == {expected})
+    #expect(Math.add(2, 3) == {expected}, "POLYGUARD_EXPECTED_ASSERTION_FAILURE")
 }}
 """,
         )
@@ -212,7 +217,10 @@ def test_real_toolchain_fixture_fails_on_assertion(tmp_path: Path, language: str
     _prepare_external_fixture_dependencies(tmp_path, language)
     report = run_checks(tmp_path, timeout=240)
     assert report["status"] == "FAIL", json.dumps(report, indent=2)
-    assert report["results"][0]["status"] == "FAIL", json.dumps(report, indent=2)
+    result = report["results"][0]
+    assert result["status"] == "FAIL", json.dumps(report, indent=2)
+    assert result["exit_code"] is not None and result["exit_code"] != 0, json.dumps(report, indent=2)
+    assert "POLYGUARD_EXPECTED_ASSERTION_FAILURE" in result["output"], json.dumps(report, indent=2)
 
 
 def test_repository_fixture_directory_is_not_misdetected(tmp_path: Path) -> None:
