@@ -823,3 +823,23 @@ def test_python310_tomli_fallback_import_path(monkeypatch):
     exec(compile(source, str(source_path), "exec"), compat.__dict__)
     assert compat.tomllib is fake_tomli
     assert compat.tomllib.loads("x") == {"compat": "x"}
+
+
+def test_project_files_skips_paths_that_cannot_be_resolved(tmp_path, monkeypatch):
+    bad = tmp_path / "bad.py"
+    good = tmp_path / "good.py"
+    outside = tmp_path / "outside.py"
+    bad.write_text("x = 1", encoding="utf-8")
+    good.write_text("y = 2", encoding="utf-8")
+    outside.write_text("z = 3", encoding="utf-8")
+    original_resolve = Path.resolve
+
+    def broken_resolve(path, *args, **kwargs):
+        if path.name == "bad.py":
+            raise RuntimeError("symlink loop or resolution failure")
+        if path.name == "outside.py":
+            return tmp_path.parent / "outside.py"
+        return original_resolve(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "resolve", broken_resolve)
+    assert runner._project_files(tmp_path) == [good]

@@ -146,6 +146,8 @@ def _project_files(root: Path) -> list[Path]:
         found.extend(current_path / name for name in filenames)
     safe_files = []
     for path in found:
+        if path.is_symlink():
+            continue
         try:
             if _is_within(path.resolve(), root):
                 safe_files.append(path)
