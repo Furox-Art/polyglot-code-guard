@@ -8,3 +8,12 @@ build/
 dist/
 *.egg-info/
 .polyguard-build/
+
+# Polyguard build and native test reports
+.polyguard-build/
+.polyguard-results/
+
+# Test coverage artifacts
+.coverage
+.coverage.*
+htmlcov/

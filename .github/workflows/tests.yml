@@ -10,7 +10,7 @@ permissions:
 
 jobs:
   unit:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
       matrix:
@@ -20,17 +20,61 @@ jobs:
       - uses: actions/setup-python@v7
         with:
           python-version: ${{ matrix.python-version }}
+      - uses: swift-actions/setup-swift@v2.4.0
+        with:
+          swift-version: "6.2"
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: "8.4"
+          extensions: mbstring, xml, dom
+          tools: composer:v2
+          coverage: none
       - name: Install package and test dependencies
         run: python -m pip install -e ".[test]" build twine
-      - name: Run unit tests
-        run: python -m pytest -q tests/test_runner.py
+      - name: Run all tests with 100% line and branch coverage
+        run: python -m pytest -q --cov=polyguard --cov-branch --cov-report=term-missing --cov-fail-under=100
       - name: Build distributions
         run: python -m build
       - name: Validate distributions
         run: python -m twine check dist/*
 
+  platform-smoke:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - name: Install package and test dependencies
+        run: python -m pip install -e ".[test]"
+      - name: Run cross-platform runner tests
+        run: python -m pytest -q tests/test_runner.py
+
+  swift-macos:
+    runs-on: macos-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - uses: swift-actions/setup-swift@v2.4.0
+        with:
+          swift-version: "6.2"
+      - name: Show Swift toolchain
+        run: swift --version
+      - name: Install package and test dependencies
+        run: python -m pip install -e ".[test]"
+      - name: Run real SwiftPM fixtures
+        run: python -m pytest -q tests/integration/test_toolchain_fixtures.py -k swift
+
   native-integration:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-python@v7
@@ -42,11 +86,40 @@ jobs:
       - uses: actions/setup-go@v7
         with:
           go-version: "1.27.x"
+          cache: false
+      - uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: "21"
+      - uses: actions/setup-dotnet@v6
+        with:
+          dotnet-version: "8.0.x"
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: "8.4"
+          extensions: mbstring, xml, dom
+          tools: composer:v2
+          coverage: none
+      - uses: swift-actions/setup-swift@v2.4.0
+        with:
+          swift-version: "6.2"
       - uses: dtolnay/rust-toolchain@stable
       - uses: ruby/setup-ruby@v1
         with:
           ruby-version: "3.2"
+      - name: Show native toolchain versions
+        run: |
+          java -version
+          mvn -version
+          dotnet --version
+          php --version
+          composer --version
+          swift --version
+          go version
+          cargo --version
+          node --version
+          ruby --version
       - name: Install package and test dependencies
         run: python -m pip install -e ".[test]"
-      - name: Run real compiler and test-runner fixtures
+      - name: Run all real compiler and test-runner fixtures (zero skipped tests enforced)
         run: python -m pytest -q tests/integration/test_toolchain_fixtures.py

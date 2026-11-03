@@ -40,7 +40,7 @@ polyguard verify --config ./ci/polyguard.toml
 polyguard --version
 \`\`\`
 
-Exit code is **0** for PASS and **1** for FAIL. Missing tests, missing toolchains, invalid configuration, a build/test failure, timeout, or missing positive test-execution evidence returns FAIL.
+Exit code is **0** for PASS and **1** for FAIL. Missing tests, missing toolchains, invalid configuration, a build/test failure, timeout, or missing positive test-execution evidence returns FAIL. On timeout, Polyguard terminates the command's process group/tree to avoid leaving test-runner descendants behind. Captured output is streamed and limited to the final 256 KiB per command.
 
 ## Built-in language support
 
@@ -49,16 +49,27 @@ Exit code is **0** for PASS and **1** for FAIL. Missing tests, missing toolchain
 | Python | \`compileall\`, then \`pytest -q\` | Pytest passed-test summary |
 | Rust | \`cargo test --all-targets\` | Cargo test-result summary |
 | Go | \`go test -json ./...\` | Passing test events in JSON stream |
-| JavaScript / TypeScript | \`npm test\`; TypeScript also runs \`tsc --noEmit\` when configured | Recognized runner pass summary |
-| Java | Maven test or Gradle test | Maven/Gradle test summary |
-| C# | \`dotnet test\` | .NET test-runner pass summary |
-| PHP | PHPUnit | PHPUnit success summary |
+| JavaScript / TypeScript | Direct Vitest/Jest/Mocha/TAP CLI when declared, otherwise `node --test --test-reporter=junit <absolute discovered test-file paths>`; TypeScript also runs `tsc --noEmit` when configured | Node fallback: JUnit testcase records cross-checked against a pre-execution snapshot; only that explicit file list runs; missing-name records and file-path collisions fail closed; declared runners: recognized runner summary |
+| Java | Maven `clean test` or Gradle `clean test` | Parsed Surefire/Gradle JUnit XML; at least one pass, zero failures |
+| C# | dotnet test with a Polyguard TRX prefix | Parsed TRX counters; at least one pass, zero failures |
+| PHP | PHPUnit with --log-junit | Parsed JUnit XML; at least one pass, zero failures |
 | Ruby | RSpec, or Ruby's Minitest runner | RSpec/Minitest success summary |
-| Swift | \`swift test\` | Swift test-result summary |
-| C | CMake build and CTest | CTest positive test count |
-| C++ | CMake build and CTest | CTest positive test count |
+| Swift | `swift test --parallel` | Recognized Swift Testing/XCTest runner summary with a positive passed-test count |
+| C | CMake build and CTest | Counts per-test `Passed` records; aggregate pass percentages do not prove execution |
+| C++ | CMake build and CTest | Counts per-test `Passed` records; aggregate pass percentages do not prove execution |
 
-C and C++ are separate language identifiers in configuration. JavaScript and TypeScript share the npm project plan; TypeScript type checking does not replace running tests.
+C and C++ are separate language identifiers in configuration. JavaScript and TypeScript share the same project plan; TypeScript type checking does not replace running tests. The Node built-in test-runner fallback uses its JUnit reporter and requires Node.js 18.15 or later. Polyguard passes only the test-file paths found in its pre-execution snapshot, rather than allowing Node to recursively discover files in generated or pruned directories. TypeScript test files (`.ts`, `.cts`, and `.mts`) additionally require a Node release with built-in type stripping enabled. When a supported runner dependency is declared, Polyguard invokes that runner's CLI and parses its recognized success summary. Project-defined npm `test` scripts are never treated as test-execution evidence.
+
+### Monorepos and workspaces
+
+Polyguard recursively discovers independent package roots and runs each package in its own working directory. It also recognizes common aggregator manifests and delegates execution to the native workspace command once, avoiding duplicate child-package runs:
+
+- Maven `<modules>` and Gradle `settings.gradle(.kts)`
+- Cargo `[workspace].members`
+- npm `workspaces`
+- .NET solution (`.sln`) files
+
+Only projects explicitly declared as Maven modules, Gradle includes, Cargo members, npm workspace packages, or .NET solution projects are coalesced under the aggregator root. Unlisted nested projects remain independent units. Each independently discovered project is reported separately. A failure or incomplete test report in any required project makes the overall result FAIL. For workspace aggregators, native package managers remain responsible for workspace dependency resolution and execution.
 
 ## Configure custom test commands
 
@@ -74,38 +85,35 @@ commands = [
   ["python3", "-m", "pytest", "-q"],
 ]
 test_patterns = ["tests/test_*.py", "tests/**/*.py"]
-success_patterns = ['(?m)^([0-9]+) passed']
 \`\`\`
 
 Configuration fields:
 - \`commands\`: non-empty argument arrays. Commands are launched without a shell.
 - \`test_patterns\`: at least one matching file must exist inside the project root.
-- \`success_patterns\`: optional regular expressions that extract a positive passing-test count from combined command output. If omitted, Polyguard uses the built-in pattern for that language.
 
-**Trust boundary:** a user-defined command or output regex is a project-owner assertion. A malicious or incorrect command can print a fake summary. Polyguard cannot independently prove what an arbitrary custom command did. For the strongest built-in verification, use the default language runner or a recognized test-runner adapter and its native report. Do not use \`echo\`, \`print\`, or a dummy process as a test command.
-
-The verifier rejects invalid regular expressions and test patterns that traverse outside the project root.
+**Evidence boundary:** custom \`success_patterns\` are rejected. An arbitrary output regex can be satisfied by a dummy command and cannot establish that tests executed. Custom commands may execute for diagnostics, but they cannot establish PASS: their stdout and generated reports are not trusted execution evidence. PASS requires the exact built-in command plan for the detected language project. A custom command adapter is not currently supported.
 
 ## Test evidence and verdict rules
 
 A language check returns PASS only when:
 1. The project and required test suite are detected.
 2. Every required command completes successfully.
-3. The runner output contains a positive passing-test count, or a configured custom success pattern matches one.
-4. No command failure or timeout occurs.
+3. The exact built-in command plan for the detected project ran; custom commands cannot establish PASS.
+4. A built-in runner summary or a freshly generated native structured test report proves that at least one test passed.
+5. No command failure or timeout occurs.
 
-A zero-test run, an output with no recognized success summary, or a non-zero exit code returns FAIL. In JSON and detailed output, Polyguard includes the parsed test count and the evidence summary when available.
+A zero-test run, an all-skipped suite, an output with no recognized success summary, inconsistent report counters, a malformed or stale native report, or a non-zero exit code returns FAIL. Java and PHP require freshly generated JUnit XML; C# requires a fresh TRX report. Swift uses a positive test count from the SwiftPM runner summary because Swift Testing does not produce a usable xUnit report in this workflow. A successful command exit alone is insufficient. C# currently targets the VSTest TRX logger contract; Microsoft.Testing.Platform projects that do not emit this TRX report fail closed until an MTP-specific adapter is configured. JSON and detailed output include passed, failed, skipped, and total counts when the runner report exposes them.
 
 ## Integration tests
 
-The repository includes disposable real-project fixtures for toolchains available in the local environment. Run:
+The repository includes disposable real-project fixtures for all eleven supported language identifiers, including real Java/JUnit, C#/.NET, PHP/PHPUnit, and SwiftPM/Swift Testing projects. The suite also covers mixed-language and native-workspace monorepos. Run:
 
 \`\`\`bash
 python -m pip install -e ".[test]"
 python -m pytest -q
 \`\`\`
 
-Integration fixtures are created in temporary directories and run through Polyguard's actual project discovery and command execution path. Missing local toolchains are skipped by local integration tests; CI jobs install their required toolchains explicitly.
+Integration fixtures are created in temporary directories and run through Polyguard's actual project discovery and command execution path. All required local toolchains must be installed; missing toolchains make the corresponding integration tests fail rather than skip. The repository-wide pytest hook also fails the session if any test is skipped. The native-integration CI job verifies toolchain availability and runs the complete fixture suite. The CI workflow also runs runner tests on Linux, Windows, and macOS, plus a dedicated SwiftPM fixture on macOS.
 
 ## AI coding-agent skill
 
@@ -119,17 +127,20 @@ Agents must not report successful verification unless the command exits 0 and re
 
 ## Important limitations and security
 
-Polyguard is a test-execution gate, **not a formal proof of program correctness**. PASS means that the configured commands succeeded and a positive test-pass summary was recognized. It does not guarantee adequate test coverage, correct requirements, absence of defects, or trustworthy user-defined commands/patterns.
+Polyguard is a test-execution gate, **not a formal proof of program correctness**. PASS means that the built-in command plan succeeded and positive test-pass evidence was recognized. It does not guarantee adequate test coverage, correct requirements, or absence of defects.
 
 The verifier executes project build scripts, package managers, and tests. Treat repositories and dependencies as untrusted. Run them in a disposable container or VM without secrets, privileged access, or sensitive host mounts. Polyguard does not itself provide operating-system isolation.
 
-Automatic language discovery is conservative. Custom frameworks can use explicit commands and success patterns. Full monorepo orchestration is not implemented yet: the current release does not discover every nested package or assign a separate working directory to each package. Run Polyguard separately from each package root until package-level configuration is added.
+Automatic language discovery is conservative. Custom frameworks can be configured for diagnostic execution, but custom commands cannot establish PASS. Only the built-in command plan currently produces trusted execution evidence. Polyguard discovers supported package manifests recursively and executes each discovered language package from its own project root. Multiple packages using the same language are reported separately; the overall result is FAIL if any package fails. A root-level .polyguard.toml applies its language configuration to each matching package, with test patterns evaluated relative to that package root. Workspace-specific dependency orchestration remains the responsibility of the native package manager.
 
 ## Development
+
+The CI unit-test gate requires **100% line and branch coverage** of Polyguard's own Python implementation. This measures Polyguard's code, not the test coverage of projects it verifies.
 
 \`\`\`bash
 python -m pip install -e ".[test]"
 python -m pytest -q
+python -m pytest -q --cov=polyguard --cov-branch --cov-report=term-missing --cov-fail-under=100
 python -m build
 python -m twine check dist/*
 \`\`\`
