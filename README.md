@@ -49,7 +49,7 @@ Exit code is **0** for PASS and **1** for FAIL. Missing tests, missing toolchain
 | Python | \`compileall\`, then \`pytest -q\` | Pytest passed-test summary |
 | Rust | \`cargo test --all-targets\` | Cargo test-result summary |
 | Go | \`go test -json ./...\` | Passing test events in JSON stream |
-| JavaScript / TypeScript | Direct Vitest/Jest/Mocha/TAP CLI when declared, otherwise `node --test --test-reporter=junit`; TypeScript also runs `tsc --noEmit` when configured | Node fallback: JUnit testcase records cross-checked against a pre-execution snapshot of Node-discovered test files; missing-name records and file-path collisions fail closed; declared runners: recognized runner summary |
+| JavaScript / TypeScript | Direct Vitest/Jest/Mocha/TAP CLI when declared, otherwise `node --test --test-reporter=junit <absolute discovered test-file paths>`; TypeScript also runs `tsc --noEmit` when configured | Node fallback: JUnit testcase records cross-checked against a pre-execution snapshot; only that explicit file list runs; missing-name records and file-path collisions fail closed; declared runners: recognized runner summary |
 | Java | Maven `clean test` or Gradle `clean test` | Parsed Surefire/Gradle JUnit XML; at least one pass, zero failures |
 | C# | dotnet test with a Polyguard TRX prefix | Parsed TRX counters; at least one pass, zero failures |
 | PHP | PHPUnit with --log-junit | Parsed JUnit XML; at least one pass, zero failures |
@@ -58,7 +58,7 @@ Exit code is **0** for PASS and **1** for FAIL. Missing tests, missing toolchain
 | C | CMake build and CTest | Counts per-test `Passed` records; aggregate pass percentages do not prove execution |
 | C++ | CMake build and CTest | Counts per-test `Passed` records; aggregate pass percentages do not prove execution |
 
-C and C++ are separate language identifiers in configuration. JavaScript and TypeScript share the same project plan; TypeScript type checking does not replace running tests. The Node built-in test-runner fallback uses its JUnit reporter and requires Node.js 18.15 or later. When a supported runner dependency is declared, Polyguard invokes that runner's CLI and parses its recognized success summary. Project-defined npm `test` scripts are never treated as test-execution evidence.
+C and C++ are separate language identifiers in configuration. JavaScript and TypeScript share the same project plan; TypeScript type checking does not replace running tests. The Node built-in test-runner fallback uses its JUnit reporter and requires Node.js 18.15 or later. Polyguard passes only the test-file paths found in its pre-execution snapshot, rather than allowing Node to recursively discover files in generated or pruned directories. TypeScript test files (`.ts`, `.cts`, and `.mts`) additionally require a Node release with built-in type stripping enabled. When a supported runner dependency is declared, Polyguard invokes that runner's CLI and parses its recognized success summary. Project-defined npm `test` scripts are never treated as test-execution evidence.
 
 ### Monorepos and workspaces
 

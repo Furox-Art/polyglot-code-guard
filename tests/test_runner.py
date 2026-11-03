@@ -214,6 +214,31 @@ def test_node_test_file_snapshot_covers_default_discovery_names(tmp_path: Path) 
     assert _node_test_file_paths(tmp_path, paths) == set()
 
 
+def test_javascript_has_test_recognizes_node_default_file_names(tmp_path: Path) -> None:
+    root_test = tmp_path / "test.js"
+    root_test.write_text(
+        "const test = require('node:test');\n"
+        "test('root test works', () => {});\n",
+        encoding="utf-8",
+    )
+    type_commonjs = tmp_path / "sample-test.cts"
+    type_commonjs.write_text(
+        "const test = require('node:test');\n"
+        "test('commonjs type test works', () => {});\n",
+        encoding="utf-8",
+    )
+    type_module = tmp_path / "nested" / "test" / "helper.mts"
+    type_module.parent.mkdir(parents=True)
+    type_module.write_text(
+        "import { test } from 'node:test';\n"
+        "test('module type test works', () => {});\n",
+        encoding="utf-8",
+    )
+    assert _has_test([root_test], "javascript", tmp_path)
+    assert _has_test([type_commonjs], "javascript", tmp_path)
+    assert _has_test([type_module], "javascript", tmp_path)
+
+
 def test_javascript_node_junit_requires_actual_subtest_records(tmp_path: Path) -> None:
     test_dir = tmp_path / "tests"
     test_dir.mkdir()
@@ -836,7 +861,10 @@ def test_javascript_workspace_runs_once_from_workspace_root(tmp_path: Path, monk
         calls.append((command, Path(cwd)))
         return SimpleNamespace(
             returncode=0,
-            stdout="# tests 1\n# pass 1\n# fail 0\n",
+            stdout=(
+                '<?xml version="1.0" encoding="utf-8"?>'
+                '<testsuites><testcase name="api works" time="0.01" classname="test"/></testsuites>'
+            ),
         )
 
     monkeypatch.setattr(runner, "_run_command", fake_run)
@@ -847,7 +875,10 @@ def test_javascript_workspace_runs_once_from_workspace_root(tmp_path: Path, monk
     assert len(report["results"]) == 1
     assert Path(report["results"][0]["project_root"]) == tmp_path
     assert len(calls) == 1
-    assert calls[0][0][:2] == ["node", "--test"]
+    assert calls[0][0] == [
+        "node", "--test", "--test-reporter=junit",
+        str((tmp_path / "packages/api/test/api.test.js").resolve()),
+    ]
     assert calls[0][0][0] != "npm"
 
 
@@ -882,7 +913,9 @@ def test_javascript_ignores_arbitrary_npm_test_script(tmp_path: Path, monkeypatc
     report = runner.run_checks(tmp_path)
 
     assert report["status"] == "PASS", report
-    assert calls == [["node", "--test", "--test-reporter=junit"]]
+    assert calls == [[
+        "node", "--test", "--test-reporter=junit", str((tmp_path / "test/math.test.js").resolve()),
+    ]]
     assert report["results"][0]["tests_passed"] == 1
 
 

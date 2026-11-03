@@ -82,12 +82,45 @@ def test_default_plans_handles_workspace_manifest(tmp_path):
     assert runner._default_plans(tmp_path)["rust"] == [["cargo", "test", "--workspace", "--all-targets"]]
 
 
-def test_default_plans_skips_invalid_javascript_packages_and_uses_node_test(tmp_path):
+def test_default_plans_requires_discovered_node_test_files(tmp_path):
     (tmp_path / "package.json").write_text("{broken", encoding="utf-8")
     (tmp_path / "app.js").write_text("module.exports = 1", encoding="utf-8")
-    assert runner._default_plans(tmp_path)["javascript"] == [["node", "--test", "--test-reporter=junit"]]
+    assert runner._default_plans(tmp_path)["javascript"] == []
     (tmp_path / "package.json").write_text("[]", encoding="utf-8")
-    assert runner._default_plans(tmp_path)["javascript"] == [["node", "--test", "--test-reporter=junit"]]
+    assert runner._default_plans(tmp_path)["javascript"] == []
+
+
+def test_default_plans_node_fallback_uses_explicit_discovered_files(tmp_path):
+    (tmp_path / "package.json").write_text("{}", encoding="utf-8")
+    (tmp_path / "app.js").write_text("module.exports = 1", encoding="utf-8")
+    for relative in (
+        "-sample-test.js", "test/helper.js", "tests/sample.test.js",
+        "tests/sample-test.cts", "test/helper.mts", "dist/ignored.test.js",
+    ):
+        path = tmp_path / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("process.exit(0);\n", encoding="utf-8")
+    expected_files = [
+        str((tmp_path / relative).resolve())
+        for relative in (
+            "-sample-test.js", "test/helper.js", "test/helper.mts",
+            "tests/sample-test.cts", "tests/sample.test.js",
+        )
+    ]
+    assert runner._default_plans(tmp_path)["javascript"] == [[
+        "node", "--test", "--test-reporter=junit", *expected_files,
+    ]]
+
+    type_only = tmp_path / "type-only"
+    type_only.mkdir()
+    (type_only / "package.json").write_text("{}", encoding="utf-8")
+    (type_only / "test.cts").write_text(
+        "const test = require('node:test'); test('type only', () => {});\\n",
+        encoding="utf-8",
+    )
+    assert runner._default_plans(type_only)["javascript"] == [[
+        "node", "--test", "--test-reporter=junit", str((type_only / "test.cts").resolve()),
+    ]]
 
 
 def test_default_plans_recognizes_javascript_runners_and_typescript(tmp_path):

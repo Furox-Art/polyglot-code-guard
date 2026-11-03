@@ -171,6 +171,11 @@ def _has_test(files: Iterable[Path], language: str, root: Path | None = None) ->
     """Conservative source-level precheck; this is not execution evidence."""
     all_files = list(files)
     base = root.resolve() if root else None
+    node_test_files = (
+        _node_test_file_paths(base, all_files)
+        if language == "javascript" and base is not None
+        else set()
+    )
     for path in all_files:
         name = path.name.lower()
         suffix = path.suffix.lower()
@@ -186,8 +191,13 @@ def _has_test(files: Iterable[Path], language: str, root: Path | None = None) ->
         elif language == "rust" and suffix == ".rs":
             if re.search(r"#\s*\[\s*(?:test|tokio::test|async_std::test)\s*\]", content):
                 return True
-        elif language == "javascript" and suffix in {".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx"}:
-            is_test_file = in_test_tree or re.search(r"\.(test|spec)\.", name)
+        elif language == "javascript" and suffix in {".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx", ".cts", ".mts"}:
+            relative = path.relative_to(base).as_posix() if base else ""
+            is_test_file = (
+                relative in node_test_files
+                or in_test_tree
+                or re.search(r"\.(test|spec)\.", name)
+            )
             if is_test_file and re.search(r"\b(?:test|it|specify)\s*(?:\.\w+)?\s*\(", content):
                 return True
         elif language == "go" and name.endswith("_test.go"):
@@ -290,7 +300,7 @@ def _default_plans(root: Path, files: Iterable[Path] | None = None) -> dict[str,
         plans["go"] = [["go", "test", "-json", "./..."]]
 
     js_project = "package.json" in names and any(
-        p.suffix.lower() in {".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx"} for p in files
+        p.suffix.lower() in {".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx", ".cts", ".mts"} for p in files
     )
     if js_project:
         # Never delegate test execution to `npm test`: package.json scripts are
@@ -320,7 +330,14 @@ def _default_plans(root: Path, files: Iterable[Path] | None = None) -> dict[str,
             if name in runner_dependencies
         ]
         if not js_commands:
-            js_commands = [["node", "--test", "--test-reporter=junit"]]
+            # Execute exactly the pre-discovered files that Polyguard snapshots
+            # for file-level JUnit filtering. Do not let Node discover additional
+            # tests in generated or otherwise-pruned directories such as dist/.
+            node_test_files = sorted(_node_test_file_paths(root, files))
+            if node_test_files:
+                js_commands = [[
+                    "node", "--test", "--test-reporter=junit", *(str((root / path).resolve()) for path in node_test_files),
+                ]]
         if "tsconfig.json" in names:
             js_commands.append(["npx", "--no-install", "tsc", "--noEmit"])
         plans["javascript"] = js_commands

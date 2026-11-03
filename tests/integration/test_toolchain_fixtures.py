@@ -258,6 +258,9 @@ def test_node_file_without_executed_subtests_fails_closed(tmp_path: Path) -> Non
     """Node's file-level pass is not evidence that a test case ran."""
     _require_toolchains(["javascript"])
     _write(tmp_path, "package.json", '{"name":"polyguard-node-empty-fixture","version":"1.0.0"}\n')
+    # Node's recursive discovery also sees generated files that Polyguard prunes.
+    # The explicit fallback file list must prevent these from running.
+    _write(tmp_path, "dist/test.js", "const test = require('node:test');\nprocess.exit(0);\ntest('never runs', () => {});\n")
     # Exercise Node's root-level and test-directory default discovery patterns.
     for relative in ("test.js", "sample-test.js", "sample_test.js", "test-example.js", "test/helper.js"):
         _write(tmp_path, relative, "process.exit(0);\n")
@@ -274,6 +277,7 @@ def test_node_file_without_executed_subtests_fails_closed(tmp_path: Path) -> Non
     assert report["status"] == "FAIL", json.dumps(report, indent=2)
     result = report["results"][0]
     assert result["exit_code"] == 0
+    assert "dist/test.js" not in result["output"]
     assert "no passing test cases" in result["execution_evidence"].lower()
 
 
