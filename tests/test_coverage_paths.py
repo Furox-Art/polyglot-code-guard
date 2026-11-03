@@ -134,7 +134,11 @@ def test_default_plans_recognizes_javascript_runners_and_typescript(tmp_path):
     assert plans["javascript"] == [
         ["npx", "--no-install", "vitest", "run"],
         ["npx", "--no-install", "jest", "--runInBand"],
-        ["npx", "--no-install", "mocha"],
+        [
+            "npx", "--no-install", "mocha",
+            "--no-dry-run", "--pass-on-failing-test-suite=false",
+            "--forbid-pending", "--forbid-only", "--fail-zero",
+        ],
         ["npx", "--no-install", "tap"],
         ["npx", "--no-install", "tsc", "--noEmit"],
     ]

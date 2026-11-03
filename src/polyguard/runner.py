@@ -6,13 +6,14 @@ import hashlib
 import json
 import os
 import re
+import shlex
 import shutil
 import signal
 import subprocess
 import sys
 import time
 import xml.etree.ElementTree as ET
-from dataclasses import asdict, dataclass, replace
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from threading import Thread
 from typing import Iterable
@@ -167,6 +168,225 @@ def _safe_read(path: Path) -> str:
         return ""
 
 
+def _cmake_invocations(text: str) -> list[tuple[str, list[str]]]:
+    """Extract CMake commands while treating comments and bracket arguments as opaque."""
+    commands: list[tuple[str, list[str]]] = []
+
+    def bracket_end(start: int) -> int | None:
+        opener = re.match(r"\[(=*)\[", text[start:])
+        if not opener:
+            return None
+        closer = f"]{opener.group(1)}]"
+        closing_index = text.find(closer, start + len(opener.group(0)))
+        return -1 if closing_index < 0 else closing_index + len(closer)
+
+    def skip_comment(start: int) -> int:
+        bracket_start = start + 1
+        if bracket_start < len(text) and text[bracket_start] == "[":
+            end = bracket_end(bracket_start)
+            if end is not None:
+                return len(text) if end < 0 else end
+        newline = text.find("\n", start)
+        return len(text) if newline < 0 else newline + 1
+
+    index = 0
+    while index < len(text):
+        if text[index] == "#":
+            index = skip_comment(index)
+            continue
+        if text[index] == "[":
+            end = bracket_end(index)
+            if end is not None:
+                if end < 0:
+                    break
+                index = end
+                continue
+        match = re.match(r"[A-Za-z_][A-Za-z0-9_]*", text[index:])
+        if not match:
+            index += 1
+            continue
+        name = match.group(0).lower()
+        cursor = index + len(match.group(0))
+        while cursor < len(text) and text[cursor].isspace():
+            cursor += 1
+        if cursor >= len(text) or text[cursor] != "(":
+            index += len(match.group(0))
+            continue
+        cursor += 1
+        start = cursor
+        depth = 1
+        quote = False
+        escaped = False
+        malformed = False
+        while cursor < len(text) and depth:
+            char = text[cursor]
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif quote:
+                if char == '"':
+                    quote = False
+            elif char == '"':
+                quote = True
+            elif char == "[":
+                end = bracket_end(cursor)
+                if end is not None:
+                    if end < 0:
+                        malformed = True
+                        cursor = len(text)
+                        break
+                    cursor = end
+                    continue
+            elif char == "#":
+                cursor = skip_comment(cursor)
+                continue
+            elif char == "(":
+                depth += 1
+            elif char == ")":
+                depth -= 1
+            cursor += 1
+        if depth or malformed:
+            break
+        try:
+            arguments = shlex.split(text[start:cursor - 1], comments=True, posix=True)
+        except ValueError:
+            arguments = []
+        commands.append((name, arguments))
+        index = cursor
+    return commands
+
+
+_C_SOURCE_SUFFIXES = {".c"}
+_CPP_SOURCE_SUFFIXES = {".cc", ".cpp", ".cxx", ".c++"}
+_NATIVE_SOURCE_SUFFIXES = _C_SOURCE_SUFFIXES | _CPP_SOURCE_SUFFIXES
+
+
+def _native_test_source(path: Path, language: str, root: Path) -> bool:
+    raw_suffix = path.suffix
+    suffix = raw_suffix.lower()
+    content = _safe_read(path)
+    in_test_tree = _in_test_tree(root, path)
+    if language == "c":
+        return (
+            suffix in _C_SOURCE_SUFFIXES
+            and raw_suffix != ".C"
+            and in_test_tree
+            and re.search(r"\b(?:test_\w+|main)\s*\(", content) is not None
+            and "assert(" in content
+        )
+    return (
+        (suffix in _CPP_SOURCE_SUFFIXES or raw_suffix == ".C")
+        and (in_test_tree or "test" in path.name.lower())
+        and (
+            re.search(r"\b(?:TEST|TEST_F|TEST_P|TEST_CASE)\s*\(", content) is not None
+            or (
+                re.search(r"\bmain\s*\(", content) is not None
+                and "assert(" in content
+            )
+        )
+    )
+
+
+def _cmake_native_test_targets(
+    files: Iterable[Path], root: Path, language: str | None = None
+) -> dict[str, set[str]]:
+    """Map CTest-registered executable targets to languages using their test sources.
+
+    Deliberately supports only explicit add_executable source lists and explicit
+    add_test/GoogleTest/Catch2 target registration. Dynamic CMake expressions
+    are not treated as proof; unsupported layouts fail closed.
+    """
+    all_files = list(files)
+    cmake_files = [path for path in all_files if path.name.lower() == "cmakelists.txt"]
+    test_sources = {
+        (path.resolve(), "c")
+        for path in all_files
+        if _native_test_source(path, "c", root)
+    } | {
+        (path.resolve(), "cpp")
+        for path in all_files
+        if _native_test_source(path, "cpp", root)
+    }
+    targets: dict[str, set[str]] = {}
+    registrations: set[str] = set()
+
+    for cmake_file in cmake_files:
+        for command, args in _cmake_invocations(_safe_read(cmake_file)):
+            if not args:
+                continue
+            if command == "add_executable":
+                target = args[0]
+                if any(value.upper() in {"ALIAS", "IMPORTED"} for value in args[1:]):
+                    continue
+                for source in args[1:]:
+                    if source.startswith(("$", "<", ">")) or "$<" in source:
+                        continue
+                    source_path = (cmake_file.parent / source).resolve()
+                    for source_path_record, source_language in test_sources:
+                        if source_path == source_path_record:
+                            targets.setdefault(target, set()).add(source_language)
+            elif command == "add_test":
+                if args[0].upper() == "NAME":
+                    try:
+                        command_index = next(i for i, value in enumerate(args) if value.upper() == "COMMAND") + 1
+                    except StopIteration:
+                        continue
+                else:
+                    command_index = 1
+                if command_index < len(args):
+                    registrations.add(args[command_index])
+            elif command in {"gtest_discover_tests", "catch_discover_tests"}:
+                registrations.add(args[0])
+
+    registered = {
+        target: languages
+        for target, languages in targets.items()
+        if target in registrations and len(languages) == 1
+    }
+    if language is None:
+        return registered
+    return {target: languages for target, languages in registered.items() if language in languages}
+
+
+def _ctest_language_evidence(
+    language: str, output: str, files: Iterable[Path], root: Path
+) -> tuple[int | None, str]:
+    """Count verbose CTest passes only when their executable target proves the language."""
+    if _has_skipped_test_output(language, output):
+        return None, f"CTest reported skipped {language} test(s); skipped tests are not accepted."
+    targets = _cmake_native_test_targets(files, root, language)
+    if not targets:
+        return None, f"No explicitly registered CMake test executable was mapped to {language} sources."
+
+    starts = list(re.finditer(r"(?m)^\s*Start\s+\d+:\s*(.+?)\s*$", output))
+    passed = 0
+    for index, start in enumerate(starts):
+        end = starts[index + 1].start() if index + 1 < len(starts) else len(output)
+        block = output[start.end():end]
+        command_match = re.search(r"(?m)^\s*(?:\d+:\s*)?Test command:\s*(.+?)\s*$", block)
+        has_pass_record = re.search(
+            r"(?m)^\s*\d+/\d+\s+Test\s+#\d+:.*?\.{3,}\s+Passed\s+\d+(?:\.\d+)?\s+sec\s*$",
+            block,
+        )
+        if not command_match or not has_pass_record:
+            continue
+        try:
+            command_parts = shlex.split(command_match.group(1), posix=(os.name != "nt"))
+        except ValueError:
+            continue
+        if not command_parts or not command_parts[0]:
+            continue
+        executable = Path(command_parts[0].strip('"')).name
+        target_name = re.sub(r"\.exe$", "", executable, flags=re.I)
+        if language in targets.get(target_name, set()):
+            passed += 1
+
+    if passed:
+        return passed, f"CTest verbose records: {passed} passing test(s) executed by {language} test target(s)."
+    return None, f"CTest did not report a passing test executed by a registered {language} target."
+
+
 def _has_test(files: Iterable[Path], language: str, root: Path | None = None) -> bool:
     """Conservative source-level precheck; this is not execution evidence."""
     all_files = list(files)
@@ -225,27 +445,9 @@ def _has_test(files: Iterable[Path], language: str, root: Path | None = None) ->
         elif language == "swift" and suffix == ".swift":
             if in_test_tree and re.search(r"(?:\bfunc\s+test\w*\s*\(|@Test\b)", content):
                 return True
-        elif language == "c" and suffix == ".c":
-            if in_test_tree and re.search(r"\b(?:test_\w+|main)\s*\(", content) and "assert(" in content:
-                cmake = [p for p in all_files if p.name.lower() == "cmakelists.txt"]
-                cmake_text = "\n".join(_safe_read(p) for p in cmake)
-                if re.search(r"\badd_test\s*\(", cmake_text):
-                    return True
-        elif language == "cpp" and suffix in {".cc", ".cpp", ".cxx", ".hpp", ".hh", ".hxx"}:
-            has_framework_test = re.search(
-                r"\b(?:TEST|TEST_F|TEST_P|TEST_CASE)\s*\(", content
-            )
-            has_assert_harness = re.search(r"\bmain\s*\(", content) and "assert(" in content
-            if (in_test_tree or "test" in name) and (has_framework_test or has_assert_harness):
-                cmake = [p for p in all_files if p.name.lower() == "cmakelists.txt"]
-                cmake_text = "\n".join(_safe_read(p) for p in cmake)
-                enabled = re.search(
-                    r"\b(?:enable_testing)\s*\(|\binclude\s*\(\s*CTest\b", cmake_text, re.I
-                )
-                registered = re.search(
-                    r"\b(?:add_test|gtest_discover_tests|catch_discover_tests)\s*\(", cmake_text
-                )
-                if enabled and registered:
+        elif language in {"c", "cpp"} and suffix in _NATIVE_SOURCE_SUFFIXES:
+            if _native_test_source(path, language, base or path.parent):
+                if _cmake_native_test_targets(all_files, base or path.parent, language):
                     return True
     return False
 
@@ -321,7 +523,11 @@ def _default_plans(root: Path, files: Iterable[Path] | None = None) -> dict[str,
         runner_commands = {
             "vitest": ["npx", "--no-install", "vitest", "run"],
             "jest": ["npx", "--no-install", "jest", "--runInBand"],
-            "mocha": ["npx", "--no-install", "mocha"],
+            "mocha": [
+                "npx", "--no-install", "mocha",
+                "--no-dry-run", "--pass-on-failing-test-suite=false",
+                "--forbid-pending", "--forbid-only", "--fail-zero",
+            ],
             "tap": ["npx", "--no-install", "tap"],
         }
         js_commands = [
@@ -405,7 +611,7 @@ def _default_plans(root: Path, files: Iterable[Path] | None = None) -> dict[str,
         cmake_commands = [
             ["cmake", "-S", ".", "-B", ".polyguard-build", "-DBUILD_TESTING=ON"],
             ["cmake", "--build", ".polyguard-build", "--parallel"],
-            ["ctest", "--test-dir", ".polyguard-build", "--output-on-failure"],
+            ["ctest", "--test-dir", ".polyguard-build", "--output-on-failure", "-V"],
         ]
         if any(p.suffix.lower() == ".c" for p in files):
             plans["c"] = cmake_commands
@@ -774,6 +980,46 @@ def _node_test_file_paths(root: Path, files: Iterable[Path]) -> set[str]:
     return matched
 
 
+def _has_skipped_test_output(language: str, output: str) -> bool:
+    """Detect runner-reported skipped, pending, or ignored tests in text output."""
+    patterns = {
+        "python": [r"\b[1-9]\d*\s+(?:skipped|deselected)\b"],
+        "rust": [r"\b[1-9]\d*\s+(?:ignored|filtered out)\b"],
+        "javascript": [
+            r"\b[1-9]\d*\s+(?:skipped|pending|todo|deselected)\b",
+            r"(?m)^\s*#\s*(?:skip|skipped|todo)\s+[1-9]\d*\s*$",
+            r"(?im)^\s*ok\s+\d+[^\r\n]*#\s*(?:SKIP|TODO)\b",
+        ],
+        "java": [r"\bSkipped:\s*[1-9]\d*\b", r"\b[1-9]\d*\s+skipped\b"],
+        "csharp": [r"\bSkipped:\s*[1-9]\d*\b", r"\b[1-9]\d*\s+skipped\b"],
+        "php": [
+            r"\b[1-9]\d*\s+skipped\b",
+            r"\b[1-9]\d*\s+skips?\b",
+            r"\bSkipped:\s*[1-9]\d*\b",
+            r"\bIncomplete:\s*[1-9]\d*\b",
+        ],
+        "ruby": [
+            r"\b[1-9]\d*\s+(?:skips?|skipped|pending)\b",
+        ],
+        "swift": [
+            r"\b[1-9]\d*\s+(?:tests?\s+)?skipped\b",
+            r"\bTest(?:\s+Case)?\b[^\r\n]*\bskipped\b",
+        ],
+        "c": [
+            r"(?im)^\s*\d+/\d+\s+Test\s+#\d+:.*\.{3,}\s+\*{3}(?:Skipped|Not Run)\b",
+            r"(?im)^\s*The following tests did not run:\s*$",
+        ],
+        "cpp": [
+            r"(?im)^\s*\d+/\d+\s+Test\s+#\d+:.*\.{3,}\s+\*{3}(?:Skipped|Not Run)\b",
+            r"(?im)^\s*The following tests did not run:\s*$",
+        ],
+    }
+    return any(
+        re.search(pattern, output, re.IGNORECASE | re.MULTILINE)
+        for pattern in patterns.get(language, [])
+    )
+
+
 def _javascript_junit_evidence(
     output: str,
     project_root: Path | None,
@@ -787,6 +1033,14 @@ def _javascript_junit_evidence(
         return None, f"Node test runner emitted invalid JUnit XML: {exc}"
     if _xml_local_name(document.tag) not in {"testsuites", "testsuite"}:
         return None, "Node JUnit report has an unexpected root element."
+
+    for element in document.iter():
+        try:
+            skipped_count = int(element.attrib.get("skipped", "0"))
+        except (TypeError, ValueError):
+            return None, "Node JUnit report contains an invalid skipped-test count."
+        if skipped_count > 0:
+            return None, "Node JUnit report contains skipped test case(s)."
 
     cases = [node for node in document.iter() if _xml_local_name(node.tag) == "testcase"]
     if not cases:
@@ -813,7 +1067,9 @@ def _javascript_junit_evidence(
             continue
 
         child_names = {_xml_local_name(child.tag) for child in list(case)}
-        if {"failure", "error", "skipped"}.intersection(child_names):
+        if "skipped" in child_names:
+            return None, "Node JUnit report contains skipped test case(s)."
+        if {"failure", "error"}.intersection(child_names):
             continue
         passed += 1
 
@@ -831,8 +1087,11 @@ def _execution_evidence(
     """Parse a positive successful-test count from a built-in runner summary."""
     if language == "javascript" and "<?xml" in output:
         return _javascript_junit_evidence(output, project_root, node_test_files or set())
+    if language != "go" and _has_skipped_test_output(language, output):
+        return None, f"{language} runner reported skipped, pending, or ignored tests."
     if language == "go":
         passed = 0
+        skipped = False
         for line in output.splitlines():
             try:
                 event = json.loads(line)
@@ -856,8 +1115,12 @@ def _execution_evidence(
                 or not 0 <= event["Elapsed"] < float("inf")
             ):
                 return None, "go test JSON event has an invalid Elapsed field."
+            if action == "skip":
+                skipped = True
             if action == "pass" and isinstance(event.get("Test"), str) and event.get("Test"):
                 passed += 1
+        if skipped:
+            return None, "go test JSON reported skipped test(s)."
         if passed:
             return passed, f"go test JSON: {passed} passing test event(s)"
         return None, "go test JSON contained no passing test events."
@@ -881,6 +1144,30 @@ def _execution_evidence(
     # tests; take the strongest single count rather than double-counting them.
     total = max(count for _, count in counts)
     return total, f"Matched {len(counts)} execution-evidence pattern(s); {total} test(s) reported passing."
+
+
+JS_TEST_RUNNERS = frozenset({"vitest", "jest", "mocha", "tap"})
+
+
+def _javascript_runner_evidence(
+    runner_name: str,
+    output: str,
+    project_root: Path,
+    node_test_files: set[str],
+) -> tuple[int | None, str]:
+    """Require independent positive evidence and reject any reported test failures."""
+    if runner_name not in JS_TEST_RUNNERS:
+        return None, f"Unsupported JavaScript test runner: {runner_name}."
+    passed, evidence = _execution_evidence(
+        "javascript", output, project_root, node_test_files
+    )
+    if passed is None:
+        return None, f"{runner_name} did not report a positive passing-test count: {evidence}"
+    if re.search(r"\b[1-9]\d*\s+(?:failed|failing)\b", output, re.IGNORECASE) or re.search(
+        r"(?m)^\s*#\s*fail\s+[1-9]\d*\s*$", output
+    ):
+        return None, f"{runner_name} reported one or more failing tests."
+    return passed, f"{runner_name}: {evidence}"
 
 
 MAX_COMMAND_OUTPUT_BYTES = 256 * 1024
@@ -1247,7 +1534,6 @@ def run_checks(
         return _failure_report("No supported language project was detected.", "project")
 
     results: list[CheckResult] = []
-    execution_cache: dict[tuple[Path, str, tuple[tuple[str, ...], ...]], CheckResult] = {}
     all_files = _project_files(root)
     for unit in units:
         language = unit.language
@@ -1288,17 +1574,6 @@ def run_checks(
             ))
             continue
 
-        cache_language = "c-cpp-shared" if language in {"c", "cpp"} else language
-        execution_key = (
-            unit.root,
-            cache_language,
-            tuple(tuple(command) for command in commands),
-        )
-        cached_result = execution_cache.get(execution_key)
-        if cached_result is not None:
-            results.append(replace(cached_result, language=language, project_root=project_root))
-            continue
-
         try:
             _prepare_result_area(unit.root, language)
         except OSError as exc:
@@ -1313,6 +1588,7 @@ def run_checks(
         started = time.monotonic()
         last_code: int | None = 0
         output_parts: list[str] = []
+        js_runner_evidence: list[tuple[str, int, str]] = []
         failure_reason = ""
         for command in commands:
             executable = command[0]
@@ -1339,6 +1615,26 @@ def run_checks(
                 if last_code != 0:
                     failure_reason = f"Command failed with exit code {last_code}: {' '.join(command)}"
                     break
+                if (
+                    language == "javascript"
+                    and not custom_commands
+                    and len(command) > 2
+                    and command[0] == "npx"
+                    and command[1] == "--no-install"
+                    and command[2] in JS_TEST_RUNNERS
+                ):
+                    runner_passed, runner_evidence = _javascript_runner_evidence(
+                        command[2], completed.stdout, unit.root, node_test_files
+                    )
+                    if runner_passed is None:
+                        failure_reason = (
+                            f"JavaScript {command[2]} did not independently verify its test run: "
+                            f"{runner_evidence}"
+                        )
+                        break
+                    js_runner_evidence.append(
+                        (command[2], runner_passed, runner_evidence)
+                    )
             except subprocess.TimeoutExpired as exc:
                 last_code = 124
                 captured = exc.stdout or ""
@@ -1381,7 +1677,7 @@ def run_checks(
                         execution_evidence
                         or f"Could not verify native {language} test report."
                     )
-                elif tests_passed <= 0 or tests_failed > 0:
+                elif tests_passed <= 0 or tests_failed > 0 or tests_skipped > 0:
                     passed = False
                     failure_reason = (
                         f"{language} report did not establish a passing test suite: "
@@ -1389,12 +1685,22 @@ def run_checks(
                         f"total={tests_total}."
                     )
             else:
-                tests_passed, execution_evidence = _execution_evidence(
-                    language,
-                    combined_output,
-                    unit.root,
-                    node_test_files,
-                )
+                if language == "javascript" and js_runner_evidence:
+                    tests_passed = sum(item[1] for item in js_runner_evidence)
+                    execution_evidence = "Independent runner evidence: " + "; ".join(
+                        item[2] for item in js_runner_evidence
+                    )
+                elif language in {"c", "cpp"}:
+                    tests_passed, execution_evidence = _ctest_language_evidence(
+                        language, combined_output, unit_files, unit.root
+                    )
+                else:
+                    tests_passed, execution_evidence = _execution_evidence(
+                        language,
+                        combined_output,
+                        unit.root,
+                        node_test_files,
+                    )
                 if tests_passed is None:
                     passed = False
                     failure_reason = (
@@ -1418,7 +1724,6 @@ def run_checks(
             project_root=project_root,
         )
         results.append(check_result)
-        execution_cache[execution_key] = check_result
 
     status = "PASS" if results and all(item.status == "PASS" for item in results) else "FAIL"
     return {"status": status, "root": str(root), "results": [asdict(item) for item in results]}

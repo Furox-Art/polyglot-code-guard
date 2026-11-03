@@ -65,12 +65,190 @@ def test_c_and_cpp_are_distinct_language_names() -> None:
     assert normalize_language("cc") == "cpp"
 
 
+def test_cmake_invocation_parser_handles_comments_quotes_escapes_and_nested_arguments() -> None:
+    from polyguard.runner import _cmake_invocations
+
+    parsed = _cmake_invocations(
+        r"""# top-level comment
+project ( demo C CXX )
+set(nested nested(value))
+set(value "quoted \"text\"")
+add_executable(test_cpp tests/test.cpp # inline comment
+  $<TARGET_OBJECTS:objects>
+)
+not_a_cmake_command
+"""
+    )
+    assert parsed == [
+        ("project", ["demo", "C", "CXX"]),
+        ("set", ["nested", "nested(value)"]),
+        ("set", ["value", 'quoted "text"']),
+        ("add_executable", ["test_cpp", "tests/test.cpp", "$<TARGET_OBJECTS:objects>"]),
+    ]
+
+
+def test_cmake_invocation_parser_fails_closed_on_malformed_commands() -> None:
+    from polyguard.runner import _cmake_invocations
+
+    assert _cmake_invocations(r"set(value trailing\)") == []
+    assert _cmake_invocations("add_executable(target source.cpp") == []
+    assert _cmake_invocations("[=[ unterminated") == []
+    assert _cmake_invocations("#[=[ unterminated") == []
+
+
+def test_cmake_invocation_parser_ignores_bracket_arguments_and_comments() -> None:
+    from polyguard.runner import _cmake_invocations
+
+    parsed = _cmake_invocations(
+        """message([=[ ignored ) add_test(NAME phantom COMMAND test_c) ]=])
+#[==[ add_executable(phantom tests/test.c) ]==]
+add_executable(real tests/test.cpp)
+add_test(NAME real COMMAND real)
+"""
+    )
+    assert [name for name, _ in parsed] == [
+        "message",
+        "add_executable",
+        "add_test",
+    ]
+    assert parsed[-2:] == [
+        ("add_executable", ["real", "tests/test.cpp"]),
+        ("add_test", ["NAME", "real", "COMMAND", "real"]),
+    ]
+    assert _cmake_invocations(
+        "[plain]\n"
+        " [=[ ignored ) add_test(NAME phantom COMMAND phantom) ]=]\n"
+        "#[ordinary line comment\n"
+        "set(value [literal])\n"
+        "set(after yes)"
+    ) == [
+        ("set", ["value", "[literal]"]),
+        ("set", ["after", "yes"]),
+    ]
+    assert _cmake_invocations("set(value 'unterminated)") == [("set", [])]
+
+
+def test_cmake_invocation_parser_fails_closed_on_unterminated_bracket_argument() -> None:
+    from polyguard.runner import _cmake_invocations
+
+    assert _cmake_invocations("message([=[ unterminated ) add_test(NAME fake COMMAND fake)") == []
+
+
+def test_uppercase_c_extension_is_classified_as_cpp(tmp_path: Path) -> None:
+    from polyguard.runner import _native_test_source
+
+    source = tmp_path / "tests" / "test_math.C"
+    source.parent.mkdir()
+    source.write_text('#include <cassert>\\nint main() { assert(1); }\\n', encoding="utf-8")
+    assert _native_test_source(source, "cpp", tmp_path)
+    assert not _native_test_source(source, "c", tmp_path)
+
+
+def test_cmake_native_targets_require_registered_test_source_targets(tmp_path: Path) -> None:
+    from polyguard.runner import _cmake_native_test_targets
+
+    cmake = tmp_path / "CMakeLists.txt"
+    tests = tmp_path / "tests"
+    tests.mkdir()
+    c_source = tests / "test_c.c"
+    cpp_source = tests / "test_cpp.cpp"
+    c_source.write_text(
+        """#include <assert.h>
+int main(void) { assert(1); }
+""",
+        encoding="utf-8",
+    )
+    cpp_source.write_text('TEST_CASE("works") {}\n', encoding="utf-8")
+    cmake.write_text(
+        """project(mixed C CXX)
+add_executable(alias_target ALIAS test_c)
+add_executable(imported_target IMPORTED GLOBAL)
+add_executable(test_c tests/test_c.c $<IF:$<BOOL:1>,unused.c,other.c>)
+add_executable(test_cpp tests/test_cpp.cpp)
+add_executable(test_mixed tests/test_c.c tests/test_cpp.cpp)
+add_test(NAME incomplete COMMAND)
+add_test(NAME no_command)
+add_test(NAME c_test COMMAND test_c)
+add_test(NAME mixed_test COMMAND test_mixed)
+add_test(legacy_cpp test_cpp)
+gtest_discover_tests(test_cpp)
+catch_discover_tests(test_cpp)
+""",
+        encoding="utf-8",
+    )
+    files = [cmake, c_source, cpp_source]
+    assert _cmake_native_test_targets(files, tmp_path) == {
+        "test_c": {"c"},
+        "test_cpp": {"cpp"},
+    }
+    assert _cmake_native_test_targets(files, tmp_path, "c") == {"test_c": {"c"}}
+    assert _cmake_native_test_targets(files, tmp_path, "cpp") == {"test_cpp": {"cpp"}}
+
+
+def test_ctest_language_evidence_requires_matching_verbose_target(tmp_path: Path) -> None:
+    from polyguard.runner import _ctest_language_evidence
+
+    cmake = tmp_path / "CMakeLists.txt"
+    tests = tmp_path / "tests"
+    tests.mkdir()
+    c_source = tests / "test_c.c"
+    cpp_source = tests / "test_cpp.cpp"
+    c_source.write_text(
+        """#include <assert.h>
+int main(void) { assert(1); }
+""",
+        encoding="utf-8",
+    )
+    cpp_source.write_text(
+        """#include <cassert>
+int main() { assert(1); }
+""",
+        encoding="utf-8",
+    )
+    cmake.write_text(
+        """add_executable(test_c tests/test_c.c)
+add_executable(test_cpp tests/test_cpp.cpp)
+add_test(NAME c_test COMMAND test_c)
+add_test(NAME cpp_test COMMAND test_cpp)
+""",
+        encoding="utf-8",
+    )
+    files = [cmake, c_source, cpp_source]
+    c_pass = (
+        "    Start 1: c_test\n"
+        "1: Test command: /build/test_c\n"
+        "1/1 Test #1: c_test ... Passed 0.00 sec\n"
+    )
+    cpp_pass = (
+        "    Start 1: cpp_test\n"
+        "1: Test command: /build/test_cpp\n"
+        "1/1 Test #1: cpp_test ... Passed 0.00 sec\n"
+    )
+    assert _ctest_language_evidence("c", c_pass, files, tmp_path)[0] == 1
+    assert _ctest_language_evidence("cpp", cpp_pass, files, tmp_path)[0] == 1
+    assert _ctest_language_evidence("c", cpp_pass, files, tmp_path)[0] is None
+    assert _ctest_language_evidence("c", "no tests listed", files, tmp_path)[0] is None
+    assert _ctest_language_evidence(
+        "c", c_pass.replace("/build/test_c", '"unterminated'), files, tmp_path
+    )[0] is None
+    assert _ctest_language_evidence(
+        "c", c_pass.replace("/build/test_c", '""'), files, tmp_path
+    )[0] is None
+    assert _ctest_language_evidence(
+        "c", c_pass.replace("Passed 0.00 sec", "Failed 0.00 sec"), files, tmp_path
+    )[0] is None
+    assert _ctest_language_evidence(
+        "c", c_pass.replace("Test command: /build/test_c\n", ""), files, tmp_path
+    )[0] is None
+    assert _ctest_language_evidence("cpp", c_pass, [cmake], tmp_path)[0] is None
+
+
 def test_c_test_source_is_detected_only_with_registered_ctest(tmp_path: Path) -> None:
     cmake = tmp_path / "CMakeLists.txt"
     test_file = tmp_path / "tests" / "test_math.c"
     test_file.parent.mkdir()
     test_file.write_text("#include <assert.h>\nint main(void) { assert(1 + 1 == 2); }\n", encoding="utf-8")
-    cmake.write_text("enable_testing()\nadd_test(NAME math COMMAND math_tests)\n", encoding="utf-8")
+    cmake.write_text("enable_testing()\nadd_executable(math_tests tests/test_math.c)\nadd_test(NAME math COMMAND math_tests)\n", encoding="utf-8")
     assert _has_test([cmake, test_file], "c", tmp_path)
 
 
@@ -79,13 +257,15 @@ def test_cpp_test_source_is_detected_with_registered_ctest(tmp_path: Path) -> No
     test_file = tmp_path / "tests" / "test_math.cpp"
     test_file.parent.mkdir()
     test_file.write_text("#include <cassert>\nint main() { assert(1 + 1 == 2); }\n", encoding="utf-8")
-    cmake.write_text("enable_testing()\nadd_test(NAME math COMMAND math_tests)\n", encoding="utf-8")
+    cmake.write_text("enable_testing()\nadd_executable(math_tests tests/test_math.cpp)\nadd_test(NAME math COMMAND math_tests)\n", encoding="utf-8")
     assert _has_test([cmake, test_file], "cpp", tmp_path)
 
 
 def test_python_execution_evidence_requires_positive_pass_count() -> None:
     assert _execution_evidence("python", "2 passed in 0.01s")[0] == 2
     assert _execution_evidence("python", "0 passed, 2 skipped in 0.01s")[0] is None
+    assert _execution_evidence("python", "2 passed, 1 skipped in 0.01s")[0] is None
+    assert _execution_evidence("python", "2 passed, 1 deselected in 0.01s")[0] is None
     assert _execution_evidence("python", "no tests ran")[0] is None
 
 
@@ -94,6 +274,10 @@ def test_rust_execution_evidence_requires_passed_tests() -> None:
     empty = "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out"
     assert _execution_evidence("rust", good)[0] == 3
     assert _execution_evidence("rust", empty)[0] is None
+    mixed = "test result: ok. 2 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out"
+    filtered = "test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out"
+    assert _execution_evidence("rust", mixed)[0] is None
+    assert _execution_evidence("rust", filtered)[0] is None
 
 
 def test_java_evidence_rejects_skipped_only_suite() -> None:
@@ -101,20 +285,39 @@ def test_java_evidence_rejects_skipped_only_suite() -> None:
     skipped = "Tests run: 2, Failures: 0, Errors: 0, Skipped: 2"
     assert _execution_evidence("java", passed)[0] == 2
     assert _execution_evidence("java", skipped)[0] is None
+    mixed = "3 tests completed, 0 failed, 1 skipped"
+    assert _execution_evidence("java", mixed)[0] is None
 
 
 def test_ruby_evidence_rejects_skipped_only_suite() -> None:
     passed = "2 runs, 2 assertions, 0 failures, 0 errors, 0 skips"
     skipped = "2 runs, 0 assertions, 0 failures, 0 errors, 2 skips"
+    mixed = "2 examples, 0 failures, 1 pending"
+    mixed_skipped = "2 runs, 3 assertions, 0 failures, 0 errors, 1 skipped"
     assert _execution_evidence("ruby", passed)[0] == 2
     assert _execution_evidence("ruby", skipped)[0] is None
+    assert _execution_evidence("ruby", mixed)[0] is None
+    assert _execution_evidence("ruby", mixed_skipped)[0] is None
+
+
+@pytest.mark.parametrize(
+    ("language", "output"),
+    [
+        ("csharp", "Passed! - Failed: 0, Passed: 2, Skipped: 1, Total: 3"),
+        ("php", "OK (2 tests, 3 assertions), Skipped: 1"),
+        ("php", "OK (2 tests, 3 assertions), Incomplete: 1"),
+        ("swift", "Executed 2 tests, with 0 failures, 1 test skipped"),
+    ],
+)
+def test_other_runner_summaries_reject_mixed_skips(language: str, output: str) -> None:
+    assert _execution_evidence(language, output)[0] is None
 
 
 def test_go_json_evidence_rejects_non_object_event() -> None:
     assert _execution_evidence("go", "[]")[0] is None
 
 
-def test_go_json_evidence_accepts_skip_events_alongside_passes() -> None:
+def test_go_json_evidence_rejects_skip_events_alongside_passes() -> None:
     output = "\n".join([
         json.dumps({"Action": "run", "Test": "TestIncluded"}),
         json.dumps({"Action": "pass", "Test": "TestIncluded", "Elapsed": 0.001}),
@@ -122,7 +325,7 @@ def test_go_json_evidence_accepts_skip_events_alongside_passes() -> None:
         json.dumps({"Action": "skip", "Test": "TestOptional"}),
         json.dumps({"Action": "pass", "Package": "example"}),
     ])
-    assert _execution_evidence("go", output)[0] == 1
+    assert _execution_evidence("go", output)[0] is None
 
 
 def test_go_json_evidence_rejects_invalid_event_fields() -> None:
@@ -150,6 +353,8 @@ def test_go_json_evidence_counts_pass_events() -> None:
 
 
 def test_ctest_evidence_requires_real_passed_test_records() -> None:
+    from polyguard.runner import _ctest_language_evidence
+
     output = "1/1 Test #1: math ... Passed 0.00 sec\n100% tests passed, 0 tests failed out of 1"
     assert _execution_evidence("c", output)[0] == 1
     assert _execution_evidence(
@@ -163,6 +368,9 @@ def test_ctest_evidence_requires_real_passed_test_records() -> None:
     )
     assert _execution_evidence("c", skipped_named_passed)[0] is None
     assert _execution_evidence("cpp", skipped_named_passed)[0] is None
+    disabled = "1/1 Test #1: math ...***Not Run (Disabled) 0.00 sec"
+    assert _execution_evidence("c", disabled)[0] is None
+    assert _execution_evidence("cpp", disabled)[0] is None
 
     skipped_only = (
         "100% tests passed, 0 tests failed out of 1\n"
@@ -176,8 +384,18 @@ def test_ctest_evidence_requires_real_passed_test_records() -> None:
         "2/2 Test #2: skipped_test ... ***Skipped 0.00 sec\n"
         "100% tests passed, 0 tests failed out of 2"
     )
-    assert _execution_evidence("c", mixed)[0] == 1
-    assert _execution_evidence("cpp", mixed)[0] == 1
+    assert _execution_evidence("c", mixed)[0] is None
+    assert _execution_evidence("cpp", mixed)[0] is None
+    verbose_mixed = (
+        "Start 1: passing_test\n"
+        "1: Test command: /build/test_math\n"
+        "1/2 Test #1: passing_test ... Passed 0.00 sec\n"
+        "Start 2: skipped_test\n"
+        "2: Test command: /build/test_math\n"
+        "2/2 Test #2: skipped_test ... ***Skipped 0.00 sec\n"
+    )
+    assert _ctest_language_evidence("c", verbose_mixed, [], Path.cwd())[0] is None
+    assert _ctest_language_evidence("cpp", verbose_mixed, [], Path.cwd())[0] is None
 
 
 def test_node_test_file_snapshot_covers_default_discovery_names(tmp_path: Path) -> None:
@@ -288,6 +506,11 @@ def test_javascript_node_junit_rejects_invalid_and_skipped_reports(tmp_path: Pat
     assert _execution_evidence("javascript", "<?xml version='1.0'?><testsuites>", tmp_path)[0] is None
     assert _execution_evidence("javascript", "<?xml version='1.0'?><unexpected/>", tmp_path)[0] is None
     assert _execution_evidence("javascript", "<?xml version='1.0'?><testsuites/>", tmp_path)[0] is None
+    invalid_skipped_count = (
+        '<?xml version="1.0" encoding="utf-8"?>'
+        '<testsuites skipped="not-an-integer"><testcase name="real-case"/></testsuites>'
+    )
+    assert _execution_evidence("javascript", invalid_skipped_count, tmp_path)[0] is None
 
     failed_or_skipped = (
         '<?xml version="1.0" encoding="utf-8"?>'
@@ -297,6 +520,14 @@ def test_javascript_node_junit_rejects_invalid_and_skipped_reports(tmp_path: Pat
         '</testsuites>'
     )
     assert _execution_evidence("javascript", failed_or_skipped, tmp_path)[0] is None
+
+    mixed_pass_and_skip = (
+        '<?xml version="1.0" encoding="utf-8"?>'
+        '<testsuites tests="2" skipped="1">'
+        '<testcase name="passed"/><testcase name="skipped"><skipped/></testcase>'
+        '</testsuites>'
+    )
+    assert _execution_evidence("javascript", mixed_pass_and_skip, tmp_path)[0] is None
 
     unnamed_case = (
         '<?xml version="1.0" encoding="utf-8"?>'
@@ -335,9 +566,127 @@ def test_javascript_node_junit_rejects_invalid_and_skipped_reports(tmp_path: Pat
     assert _execution_evidence("javascript", whitespace_name, tmp_path)[0] is None
 
 
+@pytest.mark.parametrize(
+    ("runner_name", "output"),
+    [
+        ("vitest", "Tests 2 passed | 1 failed (3)"),
+        ("jest", "Tests: 2 passed, 1 failed, 3 total"),
+        ("mocha", "2 passing\n1 failing"),
+        ("tap", "# tests 3\n# pass 2\n# fail 1"),
+    ],
+)
+def test_javascript_runner_evidence_rejects_failures_even_with_passes(
+    runner_name: str, output: str, tmp_path: Path
+) -> None:
+    from polyguard.runner import _javascript_runner_evidence
+
+    passed, reason = _javascript_runner_evidence(runner_name, output, tmp_path, set())
+    assert passed is None
+    assert "failing tests" in reason
+
+
+def test_javascript_runner_evidence_requires_positive_summary(tmp_path: Path) -> None:
+    from polyguard.runner import _javascript_runner_evidence
+
+    passed, reason = _javascript_runner_evidence("mocha", "0 passing", tmp_path, set())
+    assert passed is None
+    assert "positive passing-test count" in reason
+    assert _javascript_runner_evidence("unknown", "1 passing", tmp_path, set())[0] is None
+    passed, reason = _javascript_runner_evidence(
+        "mocha", "2 passing\n0 failing", tmp_path, set()
+    )
+    assert passed == 2
+    assert reason.startswith("mocha:")
+
+
+@pytest.mark.parametrize(
+    ("mocha_output", "expected_status"),
+    [
+        ("2 passing (1ms)\n0 failing\n", "PASS"),
+        ("0 passing (1ms)\n", "FAIL"),
+    ],
+)
+def test_javascript_multiple_runners_require_independent_evidence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mocha_output: str,
+    expected_status: str,
+) -> None:
+    from types import SimpleNamespace
+    import polyguard.runner as runner
+
+    (tmp_path / "package.json").write_text(
+        json.dumps({"devDependencies": {"vitest": "*", "mocha": "*"}}),
+        encoding="utf-8",
+    )
+    tests = tmp_path / "tests"
+    tests.mkdir()
+    (tests / "sample.test.js").write_text(
+        "describe('sample', () => { it('runs', () => {}); });\n",
+        encoding="utf-8",
+    )
+    calls: list[list[str]] = []
+
+    def fake_run(command, *, cwd, **kwargs):
+        calls.append(command)
+        if command[0] == "npx" and command[2] == "vitest":
+            return SimpleNamespace(returncode=0, stdout="Tests 1 passed (1)\n")
+        if command[0] == "npx" and command[2] == "mocha":
+            return SimpleNamespace(returncode=0, stdout=mocha_output)
+        raise AssertionError(f"Unexpected command: {command}")
+
+    monkeypatch.setattr(runner, "_run_command", fake_run)
+    monkeypatch.setattr(runner.shutil, "which", lambda executable: f"/fake/{executable}")
+    report = runner.run_checks(tmp_path)
+
+    assert report["status"] == expected_status, report
+    assert [command[2] for command in calls] == ["vitest", "mocha"]
+    if expected_status == "FAIL":
+        assert report["results"][0]["status"] == "FAIL"
+        assert "mocha did not independently verify" in report["results"][0]["reason"]
+    else:
+        assert report["results"][0]["tests_passed"] == 3
+        assert "Independent runner evidence" in report["results"][0]["execution_evidence"]
+
+
+def test_javascript_mocha_failure_cannot_be_masked_by_passed_count(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from types import SimpleNamespace
+    import polyguard.runner as runner
+
+    (tmp_path / "package.json").write_text(
+        json.dumps({"devDependencies": {"mocha": "*"}}), encoding="utf-8"
+    )
+    tests = tmp_path / "tests"
+    tests.mkdir()
+    (tests / "sample.test.js").write_text(
+        "describe('sample', () => { it('runs', () => {}); });\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        runner,
+        "_run_command",
+        lambda command, **kwargs: SimpleNamespace(
+            returncode=0, stdout="1 passing (1ms)\n1 failing\n"
+        ),
+    )
+    monkeypatch.setattr(runner.shutil, "which", lambda executable: f"/fake/{executable}")
+    report = runner.run_checks(tmp_path)
+
+    assert report["status"] == "FAIL", report
+    assert "reported one or more failing tests" in report["results"][0]["reason"]
+
+
 def test_javascript_tap_evidence_requires_passing_tests() -> None:
     assert _execution_evidence("javascript", "# tests 2\n# pass 2\n# fail 0")[0] == 2
     assert _execution_evidence("javascript", "# tests 2\n# pass 0\n# fail 0")[0] is None
+    assert _execution_evidence(
+        "javascript", "# tests 3\n# pass 2\n# fail 0\n# skipped 1"
+    )[0] is None
+    assert _execution_evidence("javascript", "ok 2 - optional # SKIP not available")[0] is None
+    assert _execution_evidence("javascript", "# tests 3\n# pass 2\n# fail 0\n# todo 1")[0] is None
+    assert _execution_evidence("javascript", "ok 2 - optional # TODO not implemented")[0] is None
 
 
 def test_javascript_vitest_summary_requires_positive_test_count() -> None:
@@ -345,10 +694,29 @@ def test_javascript_vitest_summary_requires_positive_test_count() -> None:
     minimal_reporter = "Tests 2 passed (2)"
     zero_passed = "Test Files 1 passed (1)\nTests 0 passed | 5 skipped (5)"
     file_count_only = "Test Files 3 passed (3)"
-    assert _execution_evidence("javascript", default_reporter)[0] == 16
+    assert _execution_evidence("javascript", default_reporter)[0] is None
     assert _execution_evidence("javascript", minimal_reporter)[0] == 2
     assert _execution_evidence("javascript", zero_passed)[0] is None
     assert _execution_evidence("javascript", file_count_only)[0] is None
+
+
+def test_javascript_frameworks_reject_mixed_skipped_tests() -> None:
+    import polyguard.runner as runner
+
+    cases = [
+        ("vitest", "Tests 2 passed | 1 skipped (3)"),
+        ("jest", "Tests: 2 passed, 1 skipped, 3 total"),
+        ("mocha", "2 passing (2ms)\n1 pending"),
+        ("tap", "# tests 3\n# pass 2\n# fail 0\n# skipped 1"),
+        ("vitest", "Tests 2 passed | 1 todo (3)"),
+        ("jest", "Tests: 2 passed, 1 todo, 3 total"),
+        ("tap", "# tests 3\n# pass 2\n# fail 0\n# todo 1"),
+    ]
+    for runner_name, output in cases:
+        passed, evidence = runner._javascript_runner_evidence(
+            runner_name, output, Path.cwd(), set()
+        )
+        assert passed is None, (runner_name, evidence)
 
 
 def test_custom_config_requires_execution_evidence(tmp_path: Path) -> None:
@@ -828,6 +1196,42 @@ def test_csharp_all_skipped_trx_report_fails_closed(tmp_path: Path, monkeypatch)
     assert report["status"] == "FAIL"
     assert report["results"][0]["tests_passed"] == 0
     assert report["results"][0]["tests_skipped"] == 1
+
+
+def test_csharp_mixed_pass_and_skip_trx_report_fails_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from types import SimpleNamespace
+    import polyguard.runner as runner
+
+    (tmp_path / "Fixture.csproj").write_text("<Project />", encoding="utf-8")
+    tests_dir = tmp_path / "Tests"
+    tests_dir.mkdir()
+    (tests_dir / "AdditionTests.cs").write_text(
+        "public class AdditionTests { [Fact] public void AdditionWorks() {} }",
+        encoding="utf-8",
+    )
+
+    def fake_run(command, *, cwd, **kwargs):
+        result_dir = Path(cwd) / ".polyguard-results"
+        result_dir.mkdir(exist_ok=True)
+        (result_dir / "polyguard.trx").write_text(
+            '<TestRun><ResultSummary><Counters total="2" executed="2" passed="1" '
+            'failed="0" error="0" notExecuted="1"/></ResultSummary>'
+            '<Results><UnitTestResult outcome="Passed"/><UnitTestResult outcome="NotExecuted"/></Results></TestRun>',
+            encoding="utf-8",
+        )
+        return SimpleNamespace(returncode=0, stdout="Build succeeded.")
+
+    monkeypatch.setattr(runner.shutil, "which", lambda executable: f"/fake/{executable}")
+    monkeypatch.setattr(runner, "_run_command", fake_run)
+    report = runner.run_checks(tmp_path)
+
+    assert report["status"] == "FAIL", report
+    result = report["results"][0]
+    assert result["tests_passed"] == 1
+    assert result["tests_skipped"] == 1
+    assert "skipped=1" in result["reason"]
 
 
 def test_javascript_workspace_runs_once_from_workspace_root(tmp_path: Path, monkeypatch) -> None:
@@ -1314,7 +1718,7 @@ def test_trx_inconsistent_counters_fail_closed(tmp_path: Path) -> None:
         _parse_trx(report)
 
 
-def test_mixed_c_cpp_cmake_invocation_runs_once(tmp_path: Path, monkeypatch) -> None:
+def test_mixed_c_cpp_cmake_invocation_runs_each_language_evidence_separately(tmp_path: Path, monkeypatch) -> None:
     from types import SimpleNamespace
     import polyguard.runner as runner
 
@@ -1327,8 +1731,8 @@ def test_mixed_c_cpp_cmake_invocation_runs_once(tmp_path: Path, monkeypatch) -> 
     )
     tests_dir = tmp_path / "tests"
     tests_dir.mkdir()
-    (tests_dir / "test_c.c").write_text("#include <assert.h>\nint main(){assert(1);}\n", encoding="utf-8")
-    (tests_dir / "test_cpp.cpp").write_text("#include <cassert>\nint main(){assert(1);}\n", encoding="utf-8")
+    (tests_dir / "test_c.c").write_text("#include <assert.h>\nint main(){assert(1); }\n", encoding="utf-8")
+    (tests_dir / "test_cpp.cpp").write_text("#include <cassert>\nint main(){assert(1); }\n", encoding="utf-8")
     calls = []
 
     def fake_run(command, *, cwd, **kwargs):
@@ -1337,7 +1741,11 @@ def test_mixed_c_cpp_cmake_invocation_runs_once(tmp_path: Path, monkeypatch) -> 
             return SimpleNamespace(
                 returncode=0,
                 stdout=(
+                    "test 1\n    Start 1: c_math\n"
+                    "1: Test command: /fake/build/test_c\n1: Test Passed.\n"
                     "1/2 Test #1: c_math ... Passed 0.00 sec\n"
+                    "test 2\n    Start 2: cpp_math\n"
+                    "2: Test command: /fake/build/test_cpp\n2: Test Passed.\n"
                     "2/2 Test #2: cpp_math ... Passed 0.00 sec\n"
                     "100% tests passed, 0 tests failed out of 2\n"
                 ),
@@ -1349,7 +1757,66 @@ def test_mixed_c_cpp_cmake_invocation_runs_once(tmp_path: Path, monkeypatch) -> 
     report = runner.run_checks(tmp_path)
 
     assert report["status"] == "PASS", report
-    assert [item["language"] for item in report["results"]] == ["c", "cpp"]
+    assert [(item["language"], item["status"], item["tests_passed"]) for item in report["results"]] == [
+        ("c", "PASS", 1), ("cpp", "PASS", 1)
+    ]
+    assert sum(1 for command in calls if command[0] == "ctest") == 2
+
+
+@pytest.mark.parametrize(
+    ("registered_language", "expected"),
+    [
+        ("c", {"c": "PASS", "cpp": "FAIL"}),
+        ("cpp", {"c": "FAIL", "cpp": "PASS"}),
+    ],
+)
+def test_mixed_c_cpp_cmake_rejects_unregistered_language(
+    tmp_path: Path, monkeypatch, registered_language: str, expected: dict[str, str]
+) -> None:
+    from types import SimpleNamespace
+    import polyguard.runner as runner
+
+    registration = (
+        "add_test(NAME c_math COMMAND test_c)\n"
+        if registered_language == "c"
+        else "add_test(NAME cpp_math COMMAND test_cpp)\n"
+    )
+    (tmp_path / "CMakeLists.txt").write_text(
+        "cmake_minimum_required(VERSION 3.16)\nproject(mixed C CXX)\n"
+        "enable_testing()\nadd_executable(test_c tests/test_c.c)\n"
+        "add_executable(test_cpp tests/test_cpp.cpp)\n" + registration,
+        encoding="utf-8",
+    )
+    tests_dir = tmp_path / "tests"
+    tests_dir.mkdir()
+    (tests_dir / "test_c.c").write_text("#include <assert.h>\nint main(){assert(1); }\n", encoding="utf-8")
+    (tests_dir / "test_cpp.cpp").write_text("#include <cassert>\nint main(){assert(1); }\n", encoding="utf-8")
+    calls = []
+
+    def fake_run(command, *, cwd, **kwargs):
+        calls.append(command)
+        if command[0] == "ctest":
+            executable = "test_c" if registered_language == "c" else "test_cpp"
+            test_name = "c_math" if registered_language == "c" else "cpp_math"
+            return SimpleNamespace(
+                returncode=0,
+                stdout=(
+                    f"test 1\n    Start 1: {test_name}\n"
+                    f"1: Test command: /fake/build/{executable}\n"
+                    "1: Test Passed.\n"
+                    f"1/1 Test #1: {test_name} ... Passed 0.00 sec\n"
+                    "100% tests passed, 0 tests failed out of 1\n"
+                ),
+            )
+        return SimpleNamespace(returncode=0, stdout="")
+
+    monkeypatch.setattr(runner, "_run_command", fake_run)
+    monkeypatch.setattr(runner.shutil, "which", lambda executable: f"/fake/{executable}")
+    report = runner.run_checks(tmp_path)
+
+    observed = {item["language"]: item["status"] for item in report["results"]}
+    assert observed == expected, report
+    assert report["status"] == "FAIL"
     assert sum(1 for command in calls if command[0] == "ctest") == 1
 
 

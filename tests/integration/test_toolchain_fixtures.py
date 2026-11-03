@@ -281,6 +281,60 @@ def test_node_file_without_executed_subtests_fails_closed(tmp_path: Path) -> Non
     assert "no passing test cases" in result["execution_evidence"].lower()
 
 
+@pytest.mark.parametrize(
+    ("registered_language", "expected"),
+    [
+        ("c", {"c": "PASS", "cpp": "FAIL"}),
+        ("cpp", {"c": "FAIL", "cpp": "PASS"}),
+    ],
+)
+def test_mixed_c_cpp_ctest_registration_is_language_specific(
+    tmp_path: Path, registered_language: str, expected: dict[str, str]
+) -> None:
+    """A CTest registration for one language must not prove the other language."""
+    _require_toolchains(["c", "cpp"])
+    registration = (
+        "add_test(NAME c_math COMMAND test_c)\n"
+        if registered_language == "c"
+        else "add_test(NAME cpp_math COMMAND test_cpp)\n"
+    )
+    _write(
+        tmp_path,
+        "CMakeLists.txt",
+        "cmake_minimum_required(VERSION 3.16)\n"
+        "project(PolyguardMixedFixture C CXX)\n"
+        "enable_testing()\n"
+        "add_executable(test_c tests/test_c.c)\n"
+        "add_executable(test_cpp tests/test_cpp.cpp)\n"
+        + registration,
+    )
+    _write(
+        tmp_path,
+        "tests/test_c.c",
+        "#include <assert.h>\nint main(void) { assert(2 + 3 == 5); return 0; }\n",
+    )
+    _write(
+        tmp_path,
+        "tests/test_cpp.cpp",
+        "#include <cassert>\nint main() { assert(2 + 3 == 5); return 0; }\n",
+    )
+
+    report = run_checks(tmp_path, timeout=240)
+    observed = {item["language"]: item["status"] for item in report["results"]}
+    assert observed == expected, json.dumps(report, indent=2)
+    assert report["status"] == "FAIL"
+    registered_result = next(
+        item for item in report["results"] if item["language"] == registered_language
+    )
+    assert registered_result["tests_passed"] == 1
+    unregistered_language = "cpp" if registered_language == "c" else "c"
+    unregistered_result = next(
+        item for item in report["results"] if item["language"] == unregistered_language
+    )
+    assert unregistered_result["tests_passed"] is None
+    assert "No test suite was detected" in unregistered_result["reason"]
+
+
 @pytest.mark.parametrize("language", ["c", "cpp"])
 def test_ctest_skip_only_fixture_fails_closed(tmp_path: Path, language: str) -> None:
     """CTest returns zero for SKIP_RETURN_CODE; skipped cases must not prove PASS."""
