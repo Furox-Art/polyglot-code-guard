@@ -4,7 +4,7 @@ type: software
 title: "polyglot-code-guard"
 # Keep `version` in lockstep with pyproject.toml [project].version and
 # src/polyguard/__init__.py.
-version: 0.4.0
+version: 0.5.0
 authors:
   - name: "Furox-Art"
     email: "furkanarkn1451@gmail.com"
@@ -17,7 +17,7 @@ abstract: >-
 license: MIT
 repository-code: "https://github.com/Furox-Art/polyglot-code-guard"
 url: "https://github.com/Furox-Art/polyglot-code-guard"
-date-released: "2026-11-03"
+date-released: "2026-11-07"
 keywords:
   - "testing"
   - "code-verification"

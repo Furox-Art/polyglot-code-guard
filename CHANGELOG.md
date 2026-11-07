@@ -20,6 +20,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Correct the zero-skip integration policy documentation.
 
+## [v0.5.0] - 2026-11-07
+
+### Changed
+
+- **Python 3.10 support dropped.** `requires-python` is now `>=3.11` and the CI matrix runs 3.11, 3.12 and 3.13. No code change was needed: the package was already 3.10-compatible but the portfolio is consolidating on one support floor, and 3.10 reached end of life upstream. No 3.10 classifier was declared, so only the metadata, the matrix and the version changed.
+
 ## [v0.4.0] - 2026-11-03
 
 ### Added

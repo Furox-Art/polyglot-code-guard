@@ -4,10 +4,10 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "polyglot-code-guard"
-version = "0.4.0"
+version = "0.5.0"
 description = "Fail-closed, multi-language test verification for AI-generated code."
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.11"
 license = "MIT"
 authors = [{ name = "Furox-Art" }]
 keywords = ["testing", "code-verification", "polyglot", "ai-generated-code", "quality-gate"]
@@ -16,6 +16,9 @@ classifiers = [
   "Intended Audience :: Developers",
   "Operating System :: OS Independent",
   "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
   "Topic :: Software Development :: Testing",
 ]
 dependencies = ["tomli>=2; python_version < '3.11'"]
