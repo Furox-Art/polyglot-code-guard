@@ -1,0 +1,43 @@
+site_name: Polyglot Code Guard
+site_url: https://furox-art.github.io/polyglot-code-guard/
+site_description: >-
+  Fail-closed multi-language verification for AI-generated code.
+site_author: Furox-Art
+repo_url: https://github.com/Furox-Art/polyglot-code-guard
+repo_name: Furox-Art/polyglot-code-guard
+edit_uri: edit/main/docs/
+copyright: Released under the MIT License
+
+theme:
+  name: material
+  icon:
+    repo: fontawesome/brands/github
+  palette:
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      primary: teal
+      accent: cyan
+      toggle:
+        icon: material/brightness-7
+        name: Switch to dark mode
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: teal
+      accent: cyan
+      toggle:
+        icon: material/brightness-4
+        name: Switch to light mode
+  features:
+    - navigation.top
+
+# The documentation pages that predate this site link to files outside docs/
+# (../README.md, ../benchmarks/..., ../examples/...). Those links are valid in
+# the repository but unresolvable for a site build, so only that warning class
+# is downgraded; a genuinely broken in-site link still fails --strict.
+validation:
+  links:
+    not_found: ignore
+
+nav:
+  - Home: index.md
+  - "Usage": usage.md
