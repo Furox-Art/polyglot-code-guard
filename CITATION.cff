@@ -1,0 +1,26 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite it using the metadata from this file."
+type: software
+title: "polyglot-code-guard"
+# Keep `version` in lockstep with pyproject.toml [project].version and
+# src/polyguard/__init__.py.
+version: 0.4.0
+authors:
+  - name: "Furox-Art"
+    email: "furkanarkn1451@gmail.com"
+abstract: >-
+  Fail-closed, multi-language test verification for AI-generated code.
+  Polyguard discovers supported project types, checks for a test suite, runs the relevant
+  build and test commands, and returns a one-word verdict by default. A passing exit code is
+  not sufficient: a positive test-success summary from a recognized runner output format is
+  also required after every discovered package.
+license: MIT
+repository-code: "https://github.com/Furox-Art/polyglot-code-guard"
+url: "https://github.com/Furox-Art/polyglot-code-guard"
+date-released: "2026-11-03"
+keywords:
+  - "testing"
+  - "code-verification"
+  - "polyglot"
+  - "ai-generated-code"
+  - "quality-gate"
