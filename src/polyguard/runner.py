@@ -387,6 +387,41 @@ def _ctest_language_evidence(
     return None, f"CTest did not report a passing test executed by a registered {language} target."
 
 
+_MULTI_CONFIG_CMAKE_GENERATORS = {
+    "xcode",
+    "ninja multi-config",
+    "green hills multi",
+    "watcom wmake",
+}
+
+
+def _cmake_generator_is_multi_config(root: Path) -> bool:
+    """Report whether the effective CMake generator needs an explicit ctest config.
+
+    An existing build tree keeps its recorded generator; otherwise CMake honors
+    CMAKE_GENERATOR and finally the platform default (Visual Studio on Windows,
+    single-config Makefiles elsewhere). Multi-config generators such as MSVC
+    place test executables in per-config directories, so ctest cannot run them
+    without -C <config>.
+    """
+    generator = ""
+    cache = root / ".polyguard-build" / "CMakeCache.txt"
+    try:
+        cache_lines = cache.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        cache_lines = []
+    for line in cache_lines:
+        if line.startswith("CMAKE_GENERATOR:INTERNAL="):
+            generator = line.split("=", 1)[1].strip()
+            break
+    if not generator:
+        generator = os.environ.get("CMAKE_GENERATOR", "").strip()
+    if not generator:
+        return os.name == "nt"
+    name = generator.lower()
+    return name.startswith("visual studio") or name in _MULTI_CONFIG_CMAKE_GENERATORS
+
+
 def _has_test(files: Iterable[Path], language: str, root: Path | None = None) -> bool:
     """Conservative source-level precheck; this is not execution evidence."""
     all_files = list(files)
@@ -608,10 +643,18 @@ def _default_plans(root: Path, files: Iterable[Path] | None = None) -> dict[str,
 
     cmake_files = [p for p in files if p.name.lower() == "cmakelists.txt"]
     if cmake_files:
+        build_command = ["cmake", "--build", ".polyguard-build", "--parallel"]
+        ctest_command = ["ctest", "--test-dir", ".polyguard-build", "--output-on-failure", "-V"]
+        if _cmake_generator_is_multi_config(root):
+            # Multi-config generators (MSVC, Xcode, Ninja Multi-Config) build into
+            # per-config directories; ctest needs the matching -C <config> or it
+            # reports every test as "Not Run". Debug matches cmake --build's default.
+            build_command.extend(["--config", "Debug"])
+            ctest_command.extend(["-C", "Debug"])
         cmake_commands = [
             ["cmake", "-S", ".", "-B", ".polyguard-build", "-DBUILD_TESTING=ON"],
-            ["cmake", "--build", ".polyguard-build", "--parallel"],
-            ["ctest", "--test-dir", ".polyguard-build", "--output-on-failure", "-V"],
+            build_command,
+            ctest_command,
         ]
         if any(p.suffix.lower() == ".c" for p in files):
             plans["c"] = cmake_commands

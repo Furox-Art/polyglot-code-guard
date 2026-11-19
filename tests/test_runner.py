@@ -1704,6 +1704,111 @@ def test_windows_gradle_wrapper_uses_cmd(tmp_path: Path, monkeypatch) -> None:
     assert command[:3] == ["cmd", "/c", "gradlew.bat"]
 
 
+def _cmake_c_plan(tmp_path: Path, monkeypatch, *, os_name: str, generator: str | None = None) -> list[list[str]]:
+    import polyguard.runner as runner
+
+    monkeypatch.setattr(runner.os, "name", os_name)
+    if generator is None:
+        monkeypatch.delenv("CMAKE_GENERATOR", raising=False)
+    else:
+        monkeypatch.setenv("CMAKE_GENERATOR", generator)
+    files = [tmp_path / "CMakeLists.txt", tmp_path / "test_math.c"]
+    return runner._default_plans(tmp_path, files)["c"]
+
+
+def test_cmake_plan_adds_ctest_config_for_windows_msvc_default(tmp_path: Path, monkeypatch) -> None:
+    commands = _cmake_c_plan(tmp_path, monkeypatch, os_name="nt")
+    assert commands[1] == ["cmake", "--build", ".polyguard-build", "--parallel", "--config", "Debug"]
+    assert commands[2] == ["ctest", "--test-dir", ".polyguard-build", "--output-on-failure", "-V", "-C", "Debug"]
+
+
+def test_cmake_plan_keeps_single_config_posix_default(tmp_path: Path, monkeypatch) -> None:
+    commands = _cmake_c_plan(tmp_path, monkeypatch, os_name="posix")
+    assert commands[1] == ["cmake", "--build", ".polyguard-build", "--parallel"]
+    assert commands[2] == ["ctest", "--test-dir", ".polyguard-build", "--output-on-failure", "-V"]
+
+
+def test_cmake_plan_honors_single_config_generator_env_on_windows(tmp_path: Path, monkeypatch) -> None:
+    commands = _cmake_c_plan(tmp_path, monkeypatch, os_name="nt", generator="Ninja")
+    assert "--config" not in commands[1]
+    assert "-C" not in commands[2]
+
+
+def test_cmake_plan_honors_multi_config_generator_env_on_posix(tmp_path: Path, monkeypatch) -> None:
+    commands = _cmake_c_plan(tmp_path, monkeypatch, os_name="posix", generator="Ninja Multi-Config")
+    assert commands[1][-2:] == ["--config", "Debug"]
+    assert commands[2][-2:] == ["-C", "Debug"]
+
+
+def test_cmake_plan_recognizes_visual_studio_and_xcode_env_generators(tmp_path: Path, monkeypatch) -> None:
+    for generator in ("Visual Studio 17 2022", "Xcode", "Green Hills MULTI", "Watcom WMake"):
+        commands = _cmake_c_plan(tmp_path, monkeypatch, os_name="posix", generator=generator)
+        assert commands[2][-2:] == ["-C", "Debug"], generator
+
+
+def test_cmake_plan_prefers_cached_generator_over_env(tmp_path: Path, monkeypatch) -> None:
+    build = tmp_path / ".polyguard-build"
+    build.mkdir()
+    (build / "CMakeCache.txt").write_text(
+        "# CMakeCache\nCMAKE_GENERATOR:INTERNAL=Ninja\nCMAKE_HOME_DIRECTORY:INTERNAL=/repo\n",
+        encoding="utf-8",
+    )
+    commands = _cmake_c_plan(tmp_path, monkeypatch, os_name="nt", generator="Visual Studio 17 2022")
+    assert "-C" not in commands[2]
+
+
+def test_cmake_plan_uses_cached_multi_config_generator_on_posix(tmp_path: Path, monkeypatch) -> None:
+    build = tmp_path / ".polyguard-build"
+    build.mkdir()
+    (build / "CMakeCache.txt").write_text(
+        "CMAKE_GENERATOR:INTERNAL=Visual Studio 17 2022\n", encoding="utf-8"
+    )
+    commands = _cmake_c_plan(tmp_path, monkeypatch, os_name="posix")
+    assert commands[2][-2:] == ["-C", "Debug"]
+
+
+def test_cmake_plan_falls_back_to_env_when_cache_is_unreadable(tmp_path: Path, monkeypatch) -> None:
+    build = tmp_path / ".polyguard-build"
+    build.mkdir()
+    (build / "CMakeCache.txt").mkdir()  # a directory cannot be read as a cache file
+    commands = _cmake_c_plan(tmp_path, monkeypatch, os_name="posix", generator="Ninja Multi-Config")
+    assert commands[2][-2:] == ["-C", "Debug"]
+
+
+def test_cmake_plan_falls_back_to_env_when_cache_lacks_generator(tmp_path: Path, monkeypatch) -> None:
+    build = tmp_path / ".polyguard-build"
+    build.mkdir()
+    (build / "CMakeCache.txt").write_text("CMAKE_HOME_DIRECTORY:INTERNAL=/repo\n", encoding="utf-8")
+    commands = _cmake_c_plan(tmp_path, monkeypatch, os_name="nt", generator="Ninja")
+    assert "-C" not in commands[2]
+
+
+def test_ctest_language_evidence_accepts_msvc_debug_config_records(tmp_path: Path) -> None:
+    from polyguard.runner import _ctest_language_evidence
+
+    cmake = tmp_path / "CMakeLists.txt"
+    tests = tmp_path / "tests"
+    tests.mkdir()
+    c_source = tests / "test_math.c"
+    c_source.write_text("#include <assert.h>\nint main(void) { assert(1); }\n", encoding="utf-8")
+    cmake.write_text(
+        "enable_testing()\nadd_executable(test_math tests/test_math.c)\n"
+        "add_test(NAME c_math COMMAND test_math)\n",
+        encoding="utf-8",
+    )
+    msvc_pass = (
+        "    Start 1: c_math\n"
+        "1: Test command: C:\\repo\\.polyguard-build\\Debug\\test_math.exe\n"
+        "1: Working Directory: C:/repo/.polyguard-build\n"
+        "1/1 Test #1: c_math ...........................   Passed    0.01 sec\n"
+    )
+    passed, evidence = _ctest_language_evidence("c", msvc_pass, [cmake, c_source], tmp_path)
+    assert passed == 1
+    assert "1 passing test(s)" in evidence
+    not_run = msvc_pass.replace("Passed    0.01 sec", "***Not Run   0.00 sec")
+    assert _ctest_language_evidence("c", not_run, [cmake, c_source], tmp_path)[0] is None
+
+
 def test_trx_inconsistent_counters_fail_closed(tmp_path: Path) -> None:
     import pytest
     from polyguard.runner import _parse_trx

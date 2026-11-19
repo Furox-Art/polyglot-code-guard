@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Pass an explicit build configuration (`--config Debug` / `ctest -C Debug`) when the
+  effective CMake generator is multi-config (MSVC, Xcode, Ninja Multi-Config), so C/C++
+  plans can reach PASS on Windows instead of CTest reporting every test as "Not Run".
 - Fail closed on ambiguous runner evidence instead of inferring test execution.
 - Reject skipped and empty test evidence; an all-skipped or zero-test run cannot produce PASS.
 - Run only explicitly discovered Node test files, and correlate Node JUnit records with the
