@@ -594,15 +594,30 @@ def test_terminate_process_tree_handles_posix_lookup_and_os_errors(monkeypatch):
     process = SimpleNamespace(pid=123, poll=lambda: None if state["alive"] else 0,
                               kill=lambda: state.__setitem__("killed", state["killed"] + 1))
     monkeypatch.setattr(runner.os, "name", "posix")
-    monkeypatch.setattr(runner.os, "killpg", lambda *args: (_ for _ in ()).throw(ProcessLookupError()))
+    # os.killpg and signal.SIGKILL only exist on POSIX; raising=False keeps this
+    # simulated-POSIX test runnable on Windows hosts.
+    monkeypatch.setattr(runner.signal, "SIGKILL", 9, raising=False)
+    monkeypatch.setattr(runner.os, "killpg", lambda *args: (_ for _ in ()).throw(ProcessLookupError()), raising=False)
     runner._terminate_process_tree(process)
     assert state["killed"] == 0
-    monkeypatch.setattr(runner.os, "killpg", lambda *args: (_ for _ in ()).throw(OSError("denied")))
+    monkeypatch.setattr(runner.os, "killpg", lambda *args: (_ for _ in ()).throw(OSError("denied")), raising=False)
     runner._terminate_process_tree(process)
     assert state["killed"] == 1
     state["alive"] = False
     runner._terminate_process_tree(process)
     assert state["killed"] == 1
+
+
+def test_terminate_process_tree_posix_killpg_success_avoids_direct_kill(monkeypatch):
+    calls = []
+    process = SimpleNamespace(pid=123, poll=lambda: None,
+                              kill=lambda: calls.append("direct-kill"))
+    monkeypatch.setattr(runner.os, "name", "posix")
+    monkeypatch.setattr(runner.signal, "SIGKILL", 9, raising=False)
+    monkeypatch.setattr(runner.os, "killpg", lambda pid, sig: calls.append((pid, sig)), raising=False)
+    runner._terminate_process_tree(process)
+    assert calls == [(123, 9)]
+    assert "direct-kill" not in calls
 
 
 @pytest.mark.parametrize("error", [OSError("taskkill failed"), subprocess.TimeoutExpired("taskkill", 10)])
