@@ -14,7 +14,7 @@ import sys
 import time
 import xml.etree.ElementTree as ET
 from dataclasses import asdict, dataclass
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from threading import Thread
 from typing import Iterable
 
@@ -371,13 +371,20 @@ def _ctest_language_evidence(
         )
         if not command_match or not has_pass_record:
             continue
+        command_text = command_match.group(1)
+        # CTest evidence can describe a Windows build even on a POSIX runner.
+        # Keep its backslashes intact when extracting the executable name.
+        windows_command = os.name == "nt" or re.match(
+            r"""^["']?(?:[A-Za-z]:|\\\\)""", command_text
+        ) is not None
         try:
-            command_parts = shlex.split(command_match.group(1), posix=(os.name != "nt"))
+            command_parts = shlex.split(command_text, posix=not windows_command)
         except ValueError:
             continue
         if not command_parts or not command_parts[0]:
             continue
-        executable = Path(command_parts[0].strip('"')).name
+        path_type = PureWindowsPath if windows_command else Path
+        executable = path_type(command_parts[0].strip('"')).name
         target_name = re.sub(r"\.exe$", "", executable, flags=re.I)
         if language in targets.get(target_name, set()):
             passed += 1
