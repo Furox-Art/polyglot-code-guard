@@ -153,6 +153,12 @@ GitHub Actions builds the distributions and publishes with PyPI Trusted Publishi
 - Workflow: \`publish.yml\`
 - Environment: \`pypi\`
 
+## npm command
+
+Install the matching `polyglot-code-guard` Python release in an active environment,
+then run `npm install -g polyglot-code-guard`. The npm command launches
+the Python CLI. Set `POLYGUARD_PYTHON` to its Python executable when needed.
+
 ## License
 
 MIT
