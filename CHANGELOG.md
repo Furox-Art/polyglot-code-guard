@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v0.5.1] - 2026-11-23
+
+- Read Windows-style CTest command paths on every supported host so valid MSVC multi-config evidence is recognized.
+
 ### Fixed
 
 - Pass an explicit build configuration (`--config Debug` / `ctest -C Debug`) when the

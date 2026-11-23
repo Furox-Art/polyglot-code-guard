@@ -1,0 +1,22 @@
+{
+  "name": "polyglot-code-guard",
+  "version": "0.5.1",
+  "description": "CLI wrapper for Polyguard's multi-language test verification",
+  "license": "MIT",
+  "bin": {
+    "polyguard": "npm/bin/polyguard.cjs"
+  },
+  "files": [
+    "npm/bin/polyguard.cjs"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Furox-Art/polyglot-code-guard.git"
+  },
+  "publishConfig": {
+    "access": "public"
+  }
+}
